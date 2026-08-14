@@ -1,0 +1,77 @@
+{
+  "name": "@dvgui/niftipay-plugin",
+  "version": "0.0.1",
+  "description": "Niftipay fiat card payment provider for MedusaJS v2.",
+  "author": "dvgui",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dvgui/medusa-niftipay.git"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "files": [
+    ".medusa/server"
+  ],
+  "exports": {
+    ".": "./.medusa/server/src/index.js",
+    "./package.json": "./package.json",
+    "./providers/*": "./.medusa/server/src/providers/*/index.js",
+    "./*": "./.medusa/server/src/*.js"
+  },
+  "keywords": [
+    "medusa",
+    "medusa-v2",
+    "payment",
+    "plugin",
+    "niftipay",
+    "fiat",
+    "card"
+  ],
+  "scripts": {
+    "build": "medusa plugin:build",
+    "dev": "medusa plugin:develop",
+    "test": "bun test src/",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "medusa plugin:build"
+  },
+  "devDependencies": {
+    "@medusajs/admin-sdk": "2.13.1",
+    "@medusajs/cli": "2.13.1",
+    "@medusajs/framework": "2.13.1",
+    "@medusajs/icons": "2.13.1",
+    "@medusajs/medusa": "2.13.1",
+    "@medusajs/test-utils": "2.13.1",
+    "@medusajs/ui": "4.1.1",
+    "@swc/core": "1.15.18",
+    "@types/node": "^20.0.0",
+    "@types/react": "^18.3.2",
+    "@types/react-dom": "^18.2.25",
+    "prop-types": "^15.8.1",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "ts-node": "10.9.2",
+    "typescript": "5.9.3",
+    "vite": "5.4.21",
+    "yalc": "1.0.0-pre.53"
+  },
+  "peerDependencies": {
+    "@medusajs/admin-sdk": "^2.13.1",
+    "@medusajs/cli": "^2.13.1",
+    "@medusajs/framework": "^2.13.1",
+    "@medusajs/icons": "^2.13.1",
+    "@medusajs/medusa": "^2.13.1",
+    "@medusajs/test-utils": "^2.13.1",
+    "@medusajs/ui": "^4.0.25"
+  },
+  "peerDependenciesMeta": {
+    "@medusajs/admin-sdk": { "optional": true },
+    "@medusajs/icons": { "optional": true },
+    "@medusajs/ui": { "optional": true }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "bun@1.3.10"
+}

@@ -1,0 +1,11 @@
+/dist
+/.env
+/.DS_Store
+/node_modules
+/coverage
+/.cache
+/tsconfig.tsbuildinfo
+
+# Git dependencies do not run prepublishOnly. Release commits force-add this
+# build output so consuming Medusa apps receive executable provider code.
+.medusa
