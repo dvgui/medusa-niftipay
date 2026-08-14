@@ -1,30 +1,32 @@
-import { MedusaError } from "@medusajs/framework/utils"
+import { MedusaError } from "@medusajs/framework/utils";
 
-import type { NiftipayServiceFeePayer } from "../../lib/niftipay-client/types"
-import { optionalString } from "../../lib/niftipay-client/utils"
+import type { NiftipayServiceFeePayer } from "../../lib/niftipay-client/types";
+import { isRecord, optionalString } from "../../lib/niftipay-client/utils";
 
 export type NiftipayBrandSettings = Readonly<{
-  returnUrl?: string
-  failureUrl?: string
-  descriptionTemplate?: string
-}>
+  integrationId?: string;
+  webhookSecret?: string;
+  returnUrl?: string;
+  failureUrl?: string;
+  descriptionTemplate?: string;
+}>;
 
 export type NiftipayProviderOptions = Readonly<{
-  apiKey: string
-  integrationId: string
-  webhookSecret: string
-  baseUrl?: string
-  returnUrl?: string
-  failureUrl?: string
-  descriptionTemplate?: string
-  brandSettings?: Readonly<Record<string, NiftipayBrandSettings>>
-  serviceFeePayer?: NiftipayServiceFeePayer
-  allowedCurrencies?: readonly string[]
-  allowedRedirectHosts?: readonly string[]
-  webhookToleranceSeconds?: number
-  allowLegacyWebhookAuth?: boolean
-  verifiedTtlMs?: number
-}>
+  apiKey: string;
+  integrationId: string;
+  webhookSecret: string;
+  baseUrl?: string;
+  returnUrl?: string;
+  failureUrl?: string;
+  descriptionTemplate?: string;
+  brandSettings?: Readonly<Record<string, NiftipayBrandSettings>>;
+  serviceFeePayer?: NiftipayServiceFeePayer;
+  allowedCurrencies?: readonly string[];
+  allowedRedirectHosts?: readonly string[];
+  webhookToleranceSeconds?: number;
+  allowLegacyWebhookAuth?: boolean;
+  verifiedTtlMs?: number;
+}>;
 
 export type ResolvedNiftipayOptions = NiftipayProviderOptions &
   Required<
@@ -37,7 +39,7 @@ export type ResolvedNiftipayOptions = NiftipayProviderOptions &
       | "allowLegacyWebhookAuth"
       | "verifiedTtlMs"
     >
-  >
+  >;
 
 const DEFAULTS = {
   baseUrl: "https://www.niftipay.com",
@@ -54,7 +56,7 @@ const DEFAULTS = {
   | "webhookToleranceSeconds"
   | "allowLegacyWebhookAuth"
   | "verifiedTtlMs"
->
+>;
 
 export const withDefaults = (
   options: NiftipayProviderOptions,
@@ -70,7 +72,7 @@ export const withDefaults = (
   allowLegacyWebhookAuth:
     options.allowLegacyWebhookAuth ?? DEFAULTS.allowLegacyWebhookAuth,
   verifiedTtlMs: options.verifiedTtlMs ?? DEFAULTS.verifiedTtlMs,
-})
+});
 
 export const validateNiftipayOptions = (
   options: Record<string, unknown>,
@@ -80,15 +82,42 @@ export const validateNiftipayOptions = (
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,
         `Niftipay ${key} is required when the provider is enabled`,
-      )
+      );
     }
   }
 
-  const secret = optionalString(options.webhookSecret) ?? ""
+  const secret = optionalString(options.webhookSecret) ?? "";
   if (secret.length < 32) {
     throw new MedusaError(
       MedusaError.Types.INVALID_DATA,
       "Niftipay webhookSecret must contain at least 32 characters",
-    )
+    );
   }
-}
+
+  const brandSettings = isRecord(options.brandSettings)
+    ? options.brandSettings
+    : {};
+  for (const [brandSlug, candidate] of Object.entries(brandSettings)) {
+    if (!isRecord(candidate)) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `Niftipay brandSettings.${brandSlug} must be an object`,
+      );
+    }
+
+    const integrationId = optionalString(candidate.integrationId);
+    const webhookSecret = optionalString(candidate.webhookSecret);
+    if (Boolean(integrationId) !== Boolean(webhookSecret)) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `Niftipay brandSettings.${brandSlug} must configure integrationId and webhookSecret together`,
+      );
+    }
+    if (webhookSecret && webhookSecret.length < 32) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `Niftipay brandSettings.${brandSlug}.webhookSecret must contain at least 32 characters`,
+      );
+    }
+  }
+};
