@@ -5,6 +5,10 @@ export {
 } from "./constants"
 export { NiftipayClient } from "./lib/niftipay-client/client"
 export {
+  currencyMinorUnits,
+  toMinorUnits,
+} from "./lib/niftipay-client/money"
+export {
   signNiftipayWebhook,
   verifyNiftipayWebhook,
 } from "./lib/niftipay-client/webhook"
