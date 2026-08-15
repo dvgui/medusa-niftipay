@@ -24,7 +24,8 @@ const options = {
   webhookSecret: secret,
   returnUrl: "https://store.example/payment-return/{cart_id}",
   failureUrl: "https://store.example/payment-failed/{cart_id}",
-  descriptionTemplate: "Medusa {brand_slug} cart {cart_id}",
+  descriptionTemplate:
+    "Medusa {brand_slug} cart {cart_id} — {customer_name}",
 };
 
 const brandOptions = {
@@ -79,6 +80,9 @@ describe("Niftipay payment initiation", () => {
         session_id: sessionId,
         cart_id: cartId,
         brand_slug: "buyreta_uk",
+        customer_name: "  Ada   Lovelace  ",
+        phone: "+44 7700 900000",
+        shipping_address: { address_1: "1 Example Street" },
       },
     } as never);
 
@@ -93,7 +97,7 @@ describe("Niftipay payment initiation", () => {
       currency: "GBP",
       amount: 10,
       email: "customer@example.com",
-      description: `Medusa buyreta_uk cart ${cartId}`,
+      description: `Medusa buyreta_uk cart ${cartId} — Ada Lovelace`,
       reference: sessionId,
       merchantReference: sessionId,
       serviceFeePayer: "merchant",
@@ -101,6 +105,9 @@ describe("Niftipay payment initiation", () => {
       failureUrl: `https://store.example/payment-failed/${cartId}`,
     });
     expect(body).not.toHaveProperty("webhookSecret");
+    expect(body).not.toHaveProperty("customerName");
+    expect(body).not.toHaveProperty("phone");
+    expect(body).not.toHaveProperty("shipping_address");
     expect(request.init?.headers).toEqual(
       expect.objectContaining({ "x-api-key": "test-api-key" }),
     );
@@ -113,6 +120,7 @@ describe("Niftipay payment initiation", () => {
         niftipay_order_key: "33351",
         niftipay_reference: sessionId,
         niftipay_email: "customer@example.com",
+        niftipay_customer_name: "Ada Lovelace",
       }),
     );
   });
@@ -204,10 +212,12 @@ describe("Niftipay payment initiation", () => {
 
 const buildWebhookService = ({
   storedOrderId,
+  storedIntegrationId,
   brandSlug,
   serviceOptions = options,
 }: {
   storedOrderId?: string;
+  storedIntegrationId?: string;
   brandSlug?: string;
   serviceOptions?: typeof options | typeof brandOptions;
 } = {}) => {
@@ -225,6 +235,9 @@ const buildWebhookService = ({
         niftipay_order_key: "33351",
         niftipay_reference: sessionId,
         niftipay_currency: "GBP",
+        ...(storedIntegrationId
+          ? { niftipay_integration_id: storedIntegrationId }
+          : {}),
         ...(brandSlug ? { brand_slug: brandSlug } : {}),
         ...(storedOrderId ? { niftipay_order_id: storedOrderId } : {}),
       },
@@ -238,11 +251,16 @@ const buildWebhookService = ({
   return { logger: testLogger, service, update };
 };
 
-const signedPayload = (id = orderId, signingSecret = secret) => {
+const signedPayload = (
+  id = orderId,
+  signingSecret = secret,
+  integrationId?: string,
+) => {
   const data = {
     event: "paid",
     order: {
       id,
+      ...(integrationId ? { integrationId } : {}),
       currency: "GBP",
       amountCents: 1000,
       subtotalCents: 1000,
@@ -306,15 +324,62 @@ describe("Niftipay fiat webhooks", () => {
     });
 
     const wrongSecretResult = await service.getWebhookActionAndData(
-      signedPayload(orderId, secret) as never,
+      signedPayload(
+        orderId,
+        secret,
+        "buyreta-uk-integration-id",
+      ) as never,
     );
     expect(wrongSecretResult.action).toBe(PaymentActions.NOT_SUPPORTED);
     expect(update).not.toHaveBeenCalled();
 
     const result = await service.getWebhookActionAndData(
-      signedPayload(orderId, ukSecret) as never,
+      signedPayload(
+        orderId,
+        ukSecret,
+        "buyreta-uk-integration-id",
+      ) as never,
     );
     expect(result.action).toBe(PaymentActions.SUCCESSFUL);
     expect(update).toHaveBeenCalled();
+  });
+
+  it("resolves the webhook secret directly from the documented integration ID", async () => {
+    const { service, update } = buildWebhookService({
+      storedIntegrationId: "buyreta-uk-integration-id",
+      serviceOptions: brandOptions,
+    });
+
+    const result = await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        ukSecret,
+        "buyreta-uk-integration-id",
+      ) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.SUCCESSFUL);
+    expect(update).toHaveBeenCalled();
+  });
+
+  it("rejects an authenticated webhook whose integration does not match the session", async () => {
+    const {
+      logger: testLogger,
+      service,
+      update,
+    } = buildWebhookService({
+      storedIntegrationId: "buyreta-uk-integration-id",
+      serviceOptions: brandOptions,
+    });
+
+    const result = await service.getWebhookActionAndData(
+      signedPayload(orderId, secret, "test-integration-id") as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.NOT_SUPPORTED);
+    expect(update).not.toHaveBeenCalled();
+    expect(testLogger.error).toHaveBeenCalledWith(
+      expect.stringContaining("integration mismatch"),
+    );
   });
 });

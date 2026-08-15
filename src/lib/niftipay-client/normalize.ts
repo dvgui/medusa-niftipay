@@ -19,6 +19,7 @@ export const normalizeNiftipayOrder = (
   if (!isRecord(value)) return {}
   return {
     id: optionalString(value.id),
+    integrationId: optionalString(value.integrationId),
     orderKey:
       optionalString(value.orderKey) ?? optionalString(value.order_key),
     merchantReference: optionalString(value.merchantReference),
@@ -46,6 +47,9 @@ export const normalizeNiftipayWebhook = (
     const order = isRecord(value.order) ? value.order : {}
     return {
       kind: "risk_alert",
+      integrationId:
+        optionalString(alert.integrationId) ??
+        optionalString(order.integrationId),
       merchantReference:
         optionalString(alert.merchantReference) ??
         optionalString(order.merchantReference),

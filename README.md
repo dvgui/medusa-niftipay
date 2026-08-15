@@ -23,11 +23,13 @@ order API:
 | `returnUrl`         | brand/provider configuration | Successful hosted-checkout return |
 | `failureUrl`        | brand/provider configuration | Failed hosted-checkout return     |
 
-Niftipay's fiat order API does not currently accept customer names, phone
-numbers, billing addresses, or shipping addresses. This plugin therefore does
-not transmit them, and it never handles or stores raw card details. The Medusa
-payment-session ID is the primary searchable reference in Niftipay; the
-description defaults to `Medusa cart {cart_id}`.
+Niftipay's fiat order API currently accepts `email` as its only structured
+customer field. It does not expose separate customer-name, phone, billing, or
+shipping fields. The plugin can include the normalized checkout name in the
+supported `description` field through the `{customer_name}` template token; it
+does not invent undocumented request keys, and it never handles raw card
+details. The Medusa payment-session ID remains the primary searchable reference
+in Niftipay.
 
 ## Install
 
@@ -106,9 +108,18 @@ authentication bound to the originating brand.
 | `webhookToleranceSeconds` | no                                  | `300`                      |
 | `allowLegacyWebhookAuth`  | no                                  | `false`                    |
 
-Description templates support `{cart_id}`, `{session_id}`, and `{brand_slug}`.
+Description templates support `{cart_id}`, `{session_id}`, `{brand_slug}`, and
+`{customer_name}`. Customer names are whitespace-normalized and capped at 120
+characters before rendering; the final Niftipay description remains capped at
+255 characters.
 Return/failure URL templates support `{cart_id}` and `{session_id}`. All return
 and failure URLs must use HTTPS.
+
+Current fiat webhooks include `order.integrationId`. The provider resolves the
+webhook secret from that integration ID, authenticates the signature, and then
+requires it to match the integration stored on the Medusa payment session.
+Legacy webhook payloads without `integrationId` fall back to the session's
+stored integration/brand credentials.
 
 ## Niftipay dashboard
 

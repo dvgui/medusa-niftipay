@@ -45,6 +45,8 @@ import { verifyNiftipayWebhook } from "../../lib/niftipay-client/webhook";
 import {
   type NiftipayProviderOptions,
   type ResolvedNiftipayOptions,
+  resolveNiftipayCredentialsForBrand,
+  resolveNiftipayCredentialsForIntegration,
   validateNiftipayOptions,
   withDefaults,
 } from "./options";
@@ -66,6 +68,7 @@ type NiftipaySessionData = Readonly<{
   niftipay_amount: number;
   niftipay_currency: string;
   niftipay_email: string;
+  niftipay_customer_name?: string;
   niftipay_return_url?: string;
   niftipay_failure_url?: string;
   niftipay_service_fee_payer: NiftipayServiceFeePayer;
@@ -78,18 +81,24 @@ const paymentData = (value: unknown): Record<string, unknown> =>
 const numberValue = (value: unknown): number | undefined =>
   optionalNumber(value);
 
+const normalizedCustomerName = (value: unknown): string | undefined =>
+  optionalString(value)?.replace(/\s+/g, " ").slice(0, 120);
+
 const renderTemplate = (
   template: string,
   values: Readonly<{
     cartId: string;
     sessionId: string;
     brandSlug?: string;
+    customerName?: string;
   }>,
 ): string =>
   template
     .replaceAll("{cart_id}", values.cartId)
     .replaceAll("{session_id}", values.sessionId)
     .replaceAll("{brand_slug}", values.brandSlug ?? "")
+    .replaceAll("{customer_name}", values.customerName ?? "")
+    .replace(/\s+/g, " ")
     .trim()
     .slice(0, 255);
 
@@ -162,6 +171,19 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     const email =
       optionalString(input.context?.customer?.email) ??
       optionalString(data.email);
+    const customerContext = paymentData(input.context?.customer);
+    const contextCustomerName = normalizedCustomerName(
+      [
+        optionalString(customerContext.first_name),
+        optionalString(customerContext.last_name),
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join(" "),
+    );
+    const customerName =
+      normalizedCustomerName(data.customer_name) ??
+      normalizedCustomerName(customerContext.name) ??
+      contextCustomerName;
 
     if (!/^payses_[A-Za-z0-9]+$/.test(sessionId)) {
       throw new MedusaError(
@@ -208,8 +230,11 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     const brandSettings = brandSlug
       ? this.options_.brandSettings?.[brandSlug]
       : undefined;
-    const integrationId =
-      brandSettings?.integrationId ?? this.options_.integrationId;
+    const credentials = resolveNiftipayCredentialsForBrand(
+      this.options_,
+      brandSlug,
+    );
+    const integrationId = credentials.integrationId;
     const returnUrl = substituteUrl(
       brandSettings?.returnUrl ?? this.options_.returnUrl,
       { cartId, sessionId },
@@ -227,7 +252,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
     const description = renderTemplate(
       brandSettings?.descriptionTemplate ?? this.options_.descriptionTemplate,
-      { cartId, sessionId, brandSlug },
+      { cartId, sessionId, brandSlug, customerName },
     );
     const payload: NiftipayFiatOrderPayload = {
       integrationId,
@@ -261,6 +286,9 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         niftipay_amount: amount,
         niftipay_currency: currency,
         niftipay_email: email,
+        ...(customerName
+          ? { niftipay_customer_name: customerName }
+          : {}),
         ...(returnUrl ? { niftipay_return_url: returnUrl } : {}),
         ...(failureUrl ? { niftipay_failure_url: failureUrl } : {}),
         niftipay_service_fee_payer: serviceFeePayer,
@@ -408,12 +436,22 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     return orderKey ? this.store_.findByOrderKey(orderKey) : null;
   }
 
-  private webhookSecretForSession(session: NiftipaySessionRow): string {
+  private credentialsForSession(session: NiftipaySessionRow) {
+    const storedIntegrationId = optionalString(
+      session.data?.niftipay_integration_id,
+    );
+    if (storedIntegrationId) {
+      const storedCredentials = resolveNiftipayCredentialsForIntegration(
+        this.options_,
+        storedIntegrationId,
+      );
+      if (storedCredentials) return storedCredentials;
+    }
+
     const brandSlug = optionalString(session.data?.brand_slug);
-    return (
-      (brandSlug
-        ? this.options_.brandSettings?.[brandSlug]?.webhookSecret
-        : undefined) ?? this.options_.webhookSecret
+    return resolveNiftipayCredentialsForBrand(
+      this.options_,
+      brandSlug,
     );
   }
 
@@ -448,18 +486,48 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         return unsupported;
       }
 
+      const webhookIntegrationId =
+        webhook.kind === "payment"
+          ? webhook.order.integrationId
+          : webhook.integrationId;
+      const sessionCredentials = this.credentialsForSession(session);
+      const webhookCredentials = webhookIntegrationId
+        ? resolveNiftipayCredentialsForIntegration(
+            this.options_,
+            webhookIntegrationId,
+          )
+        : undefined;
+      if (webhookIntegrationId && !webhookCredentials) {
+        this.logger_.warn(
+          "[niftipay] rejected webhook for an unknown integration",
+        );
+        return unsupported;
+      }
+
       const authenticated = verifyNiftipayWebhook({
         rawBody,
         headers: payload.headers ?? {},
         data: payload.data,
         options: {
-          secret: this.webhookSecretForSession(session),
+          secret:
+            webhookCredentials?.webhookSecret ??
+            sessionCredentials.webhookSecret,
           toleranceSeconds: this.options_.webhookToleranceSeconds,
           allowLegacy: this.options_.allowLegacyWebhookAuth,
         },
       });
       if (!authenticated) {
         this.logger_.warn("[niftipay] rejected webhook authentication");
+        return unsupported;
+      }
+
+      if (
+        webhookIntegrationId &&
+        webhookIntegrationId !== sessionCredentials.integrationId
+      ) {
+        this.logger_.error(
+          `[niftipay] integration mismatch for session ${session.id}`,
+        );
         return unsupported;
       }
 

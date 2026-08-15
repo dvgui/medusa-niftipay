@@ -40,6 +40,7 @@ export type NiftipayCreatedOrder = Readonly<{
 
 export type NiftipayRemoteOrder = Readonly<{
   id?: string
+  integrationId?: string
   orderKey?: string
   merchantReference?: string
   status?: string
@@ -60,6 +61,7 @@ export type NormalizedNiftipayWebhook =
     }>
   | Readonly<{
       kind: "risk_alert"
+      integrationId?: string
       merchantReference?: string
     }>
   | Readonly<{

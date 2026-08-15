@@ -11,6 +11,17 @@ export type NiftipayBrandSettings = Readonly<{
   descriptionTemplate?: string;
 }>;
 
+export type NiftipayResolvedCredentials = Readonly<{
+  integrationId: string;
+  webhookSecret: string;
+  brandSlug?: string;
+}>;
+
+type NiftipayCredentialOptions = Pick<
+  NiftipayProviderOptions,
+  "integrationId" | "webhookSecret" | "brandSettings"
+>;
+
 export type NiftipayProviderOptions = Readonly<{
   apiKey: string;
   integrationId: string;
@@ -74,6 +85,47 @@ export const withDefaults = (
   verifiedTtlMs: options.verifiedTtlMs ?? DEFAULTS.verifiedTtlMs,
 });
 
+export const resolveNiftipayCredentialsForBrand = (
+  options: NiftipayCredentialOptions,
+  brandSlug?: string,
+): NiftipayResolvedCredentials => {
+  const brand = brandSlug ? options.brandSettings?.[brandSlug] : undefined;
+  return {
+    integrationId: brand?.integrationId ?? options.integrationId,
+    webhookSecret: brand?.webhookSecret ?? options.webhookSecret,
+    ...(brandSlug ? { brandSlug } : {}),
+  };
+};
+
+export const resolveNiftipayCredentialsForIntegration = (
+  options: NiftipayCredentialOptions,
+  integrationId: string,
+): NiftipayResolvedCredentials | undefined => {
+  if (integrationId === options.integrationId) {
+    return {
+      integrationId: options.integrationId,
+      webhookSecret: options.webhookSecret,
+    };
+  }
+
+  for (const [brandSlug, settings] of Object.entries(
+    options.brandSettings ?? {},
+  )) {
+    if (
+      settings.integrationId === integrationId &&
+      settings.webhookSecret
+    ) {
+      return {
+        integrationId,
+        webhookSecret: settings.webhookSecret,
+        brandSlug,
+      };
+    }
+  }
+
+  return undefined;
+};
+
 export const validateNiftipayOptions = (
   options: Record<string, unknown>,
 ): void => {
@@ -97,6 +149,9 @@ export const validateNiftipayOptions = (
   const brandSettings = isRecord(options.brandSettings)
     ? options.brandSettings
     : {};
+  const integrationOwners = new Map<string, string>([
+    [optionalString(options.integrationId) ?? "", "default"],
+  ]);
   for (const [brandSlug, candidate] of Object.entries(brandSettings)) {
     if (!isRecord(candidate)) {
       throw new MedusaError(
@@ -118,6 +173,16 @@ export const validateNiftipayOptions = (
         MedusaError.Types.INVALID_DATA,
         `Niftipay brandSettings.${brandSlug}.webhookSecret must contain at least 32 characters`,
       );
+    }
+    if (integrationId) {
+      const existingOwner = integrationOwners.get(integrationId);
+      if (existingOwner && existingOwner !== brandSlug) {
+        throw new MedusaError(
+          MedusaError.Types.INVALID_DATA,
+          `Niftipay integrationId must be unique per store; brandSettings.${brandSlug} duplicates ${existingOwner}`,
+        );
+      }
+      integrationOwners.set(integrationId, brandSlug);
     }
   }
 };
