@@ -28,6 +28,9 @@ export const normalizeNiftipayOrder = (
     amountCents: optionalNumber(value.amountCents),
     subtotalCents: optionalNumber(value.subtotalCents),
     serviceFeePayer: optionalString(value.serviceFeePayer),
+    email: optionalString(value.email),
+    completedAt: optionalString(value.completedAt),
+    updatedAt: optionalString(value.updatedAt),
   }
 }
 

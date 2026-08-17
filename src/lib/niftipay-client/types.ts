@@ -48,6 +48,9 @@ export type NiftipayRemoteOrder = Readonly<{
   amountCents?: number
   subtotalCents?: number
   serviceFeePayer?: string
+  email?: string
+  completedAt?: string
+  updatedAt?: string
 }>
 
 export type NiftipayWebhookOrder = NiftipayRemoteOrder &

@@ -79,6 +79,7 @@ describe("Niftipay payment initiation", () => {
       data: {
         session_id: sessionId,
         cart_id: cartId,
+        niftipay_merchant_reference: cartId,
         brand_slug: "buyreta_uk",
         customer_name: "  Ada   Lovelace  ",
         phone: "+44 7700 900000",
@@ -99,7 +100,7 @@ describe("Niftipay payment initiation", () => {
       email: "customer@example.com",
       description: `Medusa buyreta_uk cart ${cartId} — Ada Lovelace`,
       reference: sessionId,
-      merchantReference: sessionId,
+      merchantReference: cartId,
       serviceFeePayer: "merchant",
       returnUrl: `https://store.example/payment-return/${cartId}`,
       failureUrl: `https://store.example/payment-failed/${cartId}`,
@@ -119,6 +120,7 @@ describe("Niftipay payment initiation", () => {
         niftipay_order_id: orderId,
         niftipay_order_key: "33351",
         niftipay_reference: sessionId,
+        niftipay_merchant_reference: cartId,
         niftipay_email: "customer@example.com",
         niftipay_customer_name: "Ada Lovelace",
       }),
@@ -215,16 +217,18 @@ const buildWebhookService = ({
   storedIntegrationId,
   brandSlug,
   serviceOptions = options,
+  sessionExists = true,
 }: {
   storedOrderId?: string;
   storedIntegrationId?: string;
   brandSlug?: string;
   serviceOptions?: typeof options | typeof brandOptions;
+  sessionExists?: boolean;
 } = {}) => {
   const update = mock(async () => undefined);
+  const emit = mock(async () => undefined);
   const testLogger = logger();
-  const paymentSessionService = {
-    retrieve: mock(async () => ({
+  const session = {
       id: sessionId,
       status: "pending",
       amount: 10,
@@ -232,6 +236,8 @@ const buildWebhookService = ({
       provider_id: "pp_niftipay_niftipay",
       data: {
         session_id: sessionId,
+        cart_id: cartId,
+        niftipay_merchant_reference: cartId,
         niftipay_order_key: "33351",
         niftipay_reference: sessionId,
         niftipay_currency: "GBP",
@@ -241,20 +247,31 @@ const buildWebhookService = ({
         ...(brandSlug ? { brand_slug: brandSlug } : {}),
         ...(storedOrderId ? { niftipay_order_id: storedOrderId } : {}),
       },
-    })),
+    };
+  const paymentSessionService = {
+    retrieve: mock(async () => {
+      if (!sessionExists) throw new Error(`PaymentSession ${sessionId} not found`);
+      return session;
+    }),
+    list: mock(async () => (sessionExists ? [session] : [])),
     update,
   };
   const service = new NiftipayPaymentProviderService(
-    { logger: testLogger, paymentSessionService } as never,
+    {
+      logger: testLogger,
+      paymentSessionService,
+      event_bus: { emit },
+    } as never,
     serviceOptions,
   );
-  return { logger: testLogger, service, update };
+  return { emit, logger: testLogger, service, update };
 };
 
 const signedPayload = (
   id = orderId,
   signingSecret = secret,
   integrationId?: string,
+  merchantReference = sessionId,
 ) => {
   const data = {
     event: "paid",
@@ -265,7 +282,9 @@ const signedPayload = (
       amountCents: 1000,
       subtotalCents: 1000,
       status: "completed",
-      merchantReference: sessionId,
+      merchantReference,
+      email: "customer@example.com",
+      completedAt: "2026-08-17T07:39:56.092Z",
     },
   };
   const rawData = JSON.stringify(data);
@@ -281,6 +300,139 @@ const signedPayload = (
 };
 
 describe("Niftipay fiat webhooks", () => {
+  it("resolves a live payment session from the durable cart merchant reference", async () => {
+    const { service, update } = buildWebhookService({
+      storedOrderId: orderId,
+      storedIntegrationId: "test-integration-id",
+    });
+    const result = await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        secret,
+        "test-integration-id",
+        cartId,
+      ) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.SUCCESSFUL);
+    expect(update).toHaveBeenCalled();
+  });
+
+  it("emits an authenticated orphan-paid event for a missing cart-referenced session", async () => {
+    const { emit, service } = buildWebhookService({ sessionExists: false });
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          order: {
+            id: orderId,
+            integrationId: "test-integration-id",
+            orderKey: "33351",
+            merchantReference: cartId,
+            status: "completed",
+            currency: "GBP",
+            amountCents: 1000,
+            subtotalCents: 1000,
+            email: "customer@example.com",
+            completedAt: "2026-08-17T07:39:56.092Z",
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+
+    const result = await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        secret,
+        "test-integration-id",
+        cartId,
+      ) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.NOT_SUPPORTED);
+    expect(emit).toHaveBeenCalledWith({
+      name: "payment.niftipay_orphan_paid",
+      data: expect.objectContaining({
+        cartId,
+        niftipayOrderId: orderId,
+        niftipayOrderKey: "33351",
+        merchantReference: cartId,
+        amountMinor: 1000,
+        currencyCode: "GBP",
+        customerEmail: "customer@example.com",
+        integrationId: "test-integration-id",
+      }),
+    });
+  });
+
+  it("does not attach an old paid attempt to a newer live session on the same cart", async () => {
+    const { emit, service, update } = buildWebhookService({
+      storedOrderId: "replacement-order-id",
+      storedIntegrationId: "test-integration-id",
+    });
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          order: {
+            id: orderId,
+            integrationId: "test-integration-id",
+            orderKey: "33351",
+            merchantReference: cartId,
+            status: "completed",
+            currency: "GBP",
+            amountCents: 1000,
+            subtotalCents: 1000,
+            email: "customer@example.com",
+            completedAt: "2026-08-17T07:39:56.092Z",
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+
+    const result = await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        secret,
+        "test-integration-id",
+        cartId,
+      ) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.NOT_SUPPORTED);
+    expect(update).not.toHaveBeenCalled();
+    expect(emit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        name: "payment.niftipay_orphan_paid",
+      }),
+    );
+  });
+
+  it("never emits orphan recovery for an invalid signature", async () => {
+    const { emit, service } = buildWebhookService({ sessionExists: false });
+    const result = await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        "wrong-secret-at-least-32-characters",
+        "test-integration-id",
+        cartId,
+      ) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.NOT_SUPPORTED);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
+  it("never emits orphan recovery for an unknown integration", async () => {
+    const { emit, service } = buildWebhookService({ sessionExists: false });
+    const result = await service.getWebhookActionAndData(
+      signedPayload(orderId, secret, "unknown-integration", cartId) as never,
+    );
+
+    expect(result.action).toBe(PaymentActions.NOT_SUPPORTED);
+    expect(emit).not.toHaveBeenCalled();
+  });
+
   it("accepts the documented paid payload without an internal orderKey", async () => {
     const { service, update } = buildWebhookService();
     const result = await service.getWebhookActionAndData(

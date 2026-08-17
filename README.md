@@ -17,8 +17,8 @@ order API:
 | `currency`          | payment session              | ISO 4217 currency code            |
 | `email`             | checkout customer context    | Customer/payment lookup           |
 | `description`       | configurable template        | Human-readable cart reference     |
-| `reference`         | Medusa payment-session ID    | Unique merchant correlation key   |
-| `merchantReference` | Medusa payment-session ID    | Compatibility correlation key     |
+| `reference`         | Medusa payment-session ID    | Live-session correlation key      |
+| `merchantReference` | Medusa cart ID               | Durable late-webhook recovery key  |
 | `serviceFeePayer`   | provider configuration       | Merchant or customer              |
 | `returnUrl`         | brand/provider configuration | Successful hosted-checkout return |
 | `failureUrl`        | brand/provider configuration | Failed hosted-checkout return     |
@@ -28,8 +28,10 @@ customer field. It does not expose separate customer-name, phone, billing, or
 shipping fields. The plugin can include the normalized checkout name in the
 supported `description` field through the `{customer_name}` template token; it
 does not invent undocumented request keys, and it never handles raw card
-details. The Medusa payment-session ID remains the primary searchable reference
-in Niftipay.
+details. The cart ID is the durable searchable reference in Niftipay. Medusa
+deliberately deletes stale payment sessions whenever a cart total changes,
+while the cart survives; keeping the cart ID in `merchantReference` makes a
+late completed payment recoverable without guessing by customer email.
 
 ## Install
 
@@ -134,6 +136,15 @@ The webhook handler authenticates Niftipay's `v1=` HMAC over the exact raw
 request body, requires a timestamp within five minutes by default, and verifies
 the merchant reference, public order ID, currency, and amount against the
 Medusa payment session before marking payment successful.
+
+If the exact session was deleted or canceled, an integration-bound authenticated
+`paid` webhook is checked against Niftipay's status API and emitted as
+`payment.niftipay_orphan_paid` with the durable cart ID. The host backend owns
+the idempotent recovery workflow. A webhook for an older attempt is never
+attached to a newer session on the same cart: cart lookup also requires the
+public Niftipay order UUID. Legacy attempts whose merchant reference is only a
+deleted `payses_...` ID remain manual-recovery cases because they contain no
+durable cart identifier.
 
 ## Refunds
 

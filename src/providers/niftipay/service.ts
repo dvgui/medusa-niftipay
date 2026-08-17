@@ -2,6 +2,7 @@ import {
   AbstractPaymentProvider,
   BigNumber,
   MedusaError,
+  Modules,
   PaymentActions,
 } from "@medusajs/framework/utils";
 import type {
@@ -34,7 +35,9 @@ import { toMinorUnits } from "../../lib/niftipay-client/money";
 import { normalizeNiftipayWebhook } from "../../lib/niftipay-client/normalize";
 import type {
   NiftipayFiatOrderPayload,
+  NiftipayRemoteOrder,
   NiftipayServiceFeePayer,
+  NormalizedNiftipayWebhook,
 } from "../../lib/niftipay-client/types";
 import {
   isRecord,
@@ -62,6 +65,7 @@ type NiftipaySessionData = Readonly<{
   niftipay_order_key: string;
   niftipay_redirect_url: string;
   niftipay_reference: string;
+  niftipay_merchant_reference: string;
   niftipay_description: string;
   niftipay_integration_id: string;
   niftipay_status: string;
@@ -122,6 +126,33 @@ const substituteUrl = (
 
 const normalizedCurrency = (value: string): string => value.toUpperCase();
 
+const safeResolve = <T>(
+  container: Record<string, unknown>,
+  keys: readonly string[],
+): T | undefined => {
+  for (const key of keys) {
+    try {
+      const value = container[key];
+      if (value != null) return value as T;
+    } catch {
+      // Awilix cradle proxies throw for registrations absent from this scope.
+    }
+  }
+  return undefined;
+};
+
+type NiftipayPaymentWebhook = Extract<
+  NormalizedNiftipayWebhook,
+  { kind: "payment" }
+>;
+
+type EventBusService = {
+  emit(input: {
+    name: string;
+    data: Record<string, unknown>;
+  }): Promise<unknown>;
+};
+
 class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayProviderOptions> {
   static identifier = "niftipay";
 
@@ -129,6 +160,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
   protected options_: ResolvedNiftipayOptions;
   private readonly client_: NiftipayClient;
   private readonly store_: NiftipaySessionStore;
+  private readonly container_: InjectedDependencies;
   private readonly verifiedSessions_ = new Map<string, number>();
 
   static validateOptions(options: Record<string, unknown>): void {
@@ -141,6 +173,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
   ) {
     super(container, options);
     this.logger_ = container.logger;
+    this.container_ = container;
     this.options_ = withDefaults(options);
     this.client_ = new NiftipayClient({
       apiKey: options.apiKey,
@@ -261,7 +294,10 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       email,
       description,
       reference: sessionId,
-      merchantReference: sessionId,
+      // Medusa intentionally hard-deletes payment sessions whenever a cart's
+      // total changes. The cart ID survives that lifecycle and lets a verified
+      // late-paid webhook recover the exact checkout.
+      merchantReference: cartId,
       serviceFeePayer,
       ...(returnUrl ? { returnUrl } : {}),
       ...(failureUrl ? { failureUrl } : {}),
@@ -269,7 +305,11 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
     try {
       const created = await this.client_.createFiatOrder(payload);
-      if (created.reference && created.reference !== sessionId) {
+      if (
+        created.reference &&
+        created.reference !== sessionId &&
+        created.reference !== cartId
+      ) {
         throw new Error("Niftipay returned a different merchant reference");
       }
       const sessionData: NiftipaySessionData = {
@@ -280,6 +320,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         niftipay_order_key: created.orderKey,
         niftipay_redirect_url: created.payUrl,
         niftipay_reference: sessionId,
+        niftipay_merchant_reference: cartId,
         niftipay_description: description,
         niftipay_integration_id: integrationId,
         niftipay_status: created.status ?? "created",
@@ -428,9 +469,17 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
   private async resolveSession(
     orderKey: string | undefined,
     merchantReference: string | undefined,
+    orderId: string | undefined,
   ): Promise<NiftipaySessionRow | null> {
     if (merchantReference?.startsWith("payses_")) {
       const session = await this.store_.load(merchantReference);
+      if (session) return session;
+    }
+    if (merchantReference?.startsWith("cart_")) {
+      const session = await this.store_.findByCartId(
+        merchantReference,
+        orderId,
+      );
       if (session) return session;
     }
     return orderKey ? this.store_.findByOrderKey(orderKey) : null;
@@ -455,6 +504,154 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     );
   }
 
+  /**
+   * Emits an app-owned recovery event only after the webhook has passed the
+   * integration-bound HMAC check. The remote status lookup is a second check;
+   * signed webhook data remains the fallback during a temporary API outage.
+   */
+  private async emitOrphanPaid(
+    webhook: NiftipayPaymentWebhook,
+  ): Promise<boolean> {
+    const signed = webhook.order;
+    const cartId = signed.merchantReference;
+    if (webhook.event !== "paid" || !cartId?.startsWith("cart_")) {
+      if (webhook.event === "paid") {
+        this.logger_.error(
+          `[niftipay] authenticated orphan paid webhook has no durable cart reference (orderId=${signed.id ?? "unknown"}, reference=${cartId ?? "unknown"}); manual recovery required`,
+        );
+      }
+      return false;
+    }
+    if (!signed.id || !signed.integrationId) {
+      this.logger_.error(
+        "[niftipay] authenticated orphan paid webhook is missing order or integration ID",
+      );
+      return false;
+    }
+
+    let canonical: NiftipayRemoteOrder = signed;
+    try {
+      const remote = await this.client_.retrieveNormalizedFiatOrder(signed.id);
+      if (!remote.id || remote.id !== signed.id) {
+        this.logger_.error(
+          `[niftipay] orphan status lookup returned a different public order ID for ${signed.id}`,
+        );
+        return false;
+      }
+      if (!["completed", "paid"].includes(remote.status ?? "")) {
+        this.logger_.error(
+          `[niftipay] orphan status lookup is not completed for ${signed.id} (status=${remote.status ?? "unknown"})`,
+        );
+        return false;
+      }
+      canonical = remote;
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger_.warn(
+        `[niftipay] orphan status lookup failed for ${signed.id}; using authenticated webhook fields: ${message}`,
+      );
+    }
+
+    if (
+      canonical.integrationId &&
+      canonical.integrationId !== signed.integrationId
+    ) {
+      this.logger_.error(
+        `[niftipay] orphan integration mismatch for ${signed.id}`,
+      );
+      return false;
+    }
+    if (
+      canonical.merchantReference &&
+      canonical.merchantReference !== cartId
+    ) {
+      this.logger_.error(
+        `[niftipay] orphan merchant reference mismatch for ${signed.id}`,
+      );
+      return false;
+    }
+
+    const currency = canonical.currency ?? signed.currency;
+    if (!currency || (signed.currency && currency !== signed.currency)) {
+      this.logger_.error(
+        `[niftipay] orphan currency is missing or inconsistent for ${signed.id}`,
+      );
+      return false;
+    }
+    const amountMinor =
+      canonical.subtotalCents ??
+      canonical.amountCents ??
+      signed.subtotalCents ??
+      signed.amountCents;
+    if (!Number.isSafeInteger(amountMinor) || Number(amountMinor) <= 0) {
+      this.logger_.error(
+        `[niftipay] orphan amount is missing or invalid for ${signed.id}`,
+      );
+      return false;
+    }
+    const signedAmounts = [signed.subtotalCents, signed.amountCents].filter(
+      (value): value is number => value !== undefined,
+    );
+    if (
+      signedAmounts.length > 0 &&
+      !signedAmounts.some((value) => Math.round(value) === amountMinor)
+    ) {
+      this.logger_.error(
+        `[niftipay] orphan amount mismatch for ${signed.id}`,
+      );
+      return false;
+    }
+
+    const customerEmail = canonical.email ?? signed.email;
+    if (!customerEmail) {
+      this.logger_.error(
+        `[niftipay] orphan order ${signed.id} has no customer email; manual recovery required`,
+      );
+      return false;
+    }
+    const capturedAtIso =
+      canonical.completedAt ??
+      canonical.updatedAt ??
+      signed.completedAt ??
+      signed.updatedAt ??
+      new Date().toISOString();
+    const eventBus = safeResolve<EventBusService>(this.container_, [
+      Modules.EVENT_BUS,
+      "eventBusService",
+      "__event_bus__",
+    ]);
+    if (!eventBus) {
+      this.logger_.error(
+        `[niftipay] event bus unavailable; cannot recover orphan ${signed.id}`,
+      );
+      return false;
+    }
+
+    await eventBus.emit({
+      name: "payment.niftipay_orphan_paid",
+      data: {
+        cartId,
+        niftipayOrderId: signed.id,
+        ...(canonical.orderKey ?? signed.orderKey
+          ? { niftipayOrderKey: canonical.orderKey ?? signed.orderKey }
+          : {}),
+        merchantReference: cartId,
+        amountMinor,
+        currencyCode: currency,
+        customerEmail,
+        capturedAtIso,
+        integrationId: signed.integrationId,
+        ...(signed.reference?.startsWith("payses_")
+          ? { missingSessionId: signed.reference }
+          : {}),
+      },
+    });
+    this.logger_.warn(
+      `[niftipay] emitted payment.niftipay_orphan_paid for order ${signed.id} cart=${cartId}`,
+    );
+    return true;
+  }
+
   async getWebhookActionAndData(
     payload: ProviderWebhookPayload["payload"],
   ): Promise<WebhookActionResult> {
@@ -470,27 +667,10 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       const webhook = normalizeNiftipayWebhook(payload.data);
       if (webhook.kind === "unsupported") return unsupported;
 
-      const session = await this.resolveSession(
-        webhook.kind === "payment" ? webhook.order.orderKey : undefined,
-        webhook.kind === "payment"
-          ? (webhook.order.merchantReference ?? webhook.order.reference)
-          : webhook.merchantReference,
-      );
-      if (!session || session.deleted_at || session.status === "canceled") {
-        const event = webhook.kind === "payment" ? webhook.event : "risk_alert";
-        const orderId =
-          webhook.kind === "payment" ? webhook.order.id : undefined;
-        this.logger_.warn(
-          `[niftipay] ${event} webhook has no live payment session (orderId=${orderId ?? "unknown"})`,
-        );
-        return unsupported;
-      }
-
       const webhookIntegrationId =
         webhook.kind === "payment"
           ? webhook.order.integrationId
           : webhook.integrationId;
-      const sessionCredentials = this.credentialsForSession(session);
       const webhookCredentials = webhookIntegrationId
         ? resolveNiftipayCredentialsForIntegration(
             this.options_,
@@ -503,6 +683,50 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         );
         return unsupported;
       }
+
+      const session = await this.resolveSession(
+        webhook.kind === "payment" ? webhook.order.orderKey : undefined,
+        webhook.kind === "payment"
+          ? (webhook.order.merchantReference ?? webhook.order.reference)
+          : webhook.merchantReference,
+        webhook.kind === "payment" ? webhook.order.id : undefined,
+      );
+      if (!session || session.deleted_at || session.status === "canceled") {
+        const event = webhook.kind === "payment" ? webhook.event : "risk_alert";
+        const orderId =
+          webhook.kind === "payment" ? webhook.order.id : undefined;
+        if (!webhookCredentials) {
+          this.logger_.error(
+            `[niftipay] ${event} webhook has no live session or integration-bound credentials (orderId=${orderId ?? "unknown"}); cannot authenticate orphan recovery`,
+          );
+          return unsupported;
+        }
+
+        const authenticated = verifyNiftipayWebhook({
+          rawBody,
+          headers: payload.headers ?? {},
+          data: payload.data,
+          options: {
+            secret: webhookCredentials.webhookSecret,
+            toleranceSeconds: this.options_.webhookToleranceSeconds,
+            allowLegacy: this.options_.allowLegacyWebhookAuth,
+          },
+        });
+        if (!authenticated) {
+          this.logger_.warn("[niftipay] rejected webhook authentication");
+          return unsupported;
+        }
+
+        this.logger_.warn(
+          `[niftipay] ${event} webhook has no live payment session (orderId=${orderId ?? "unknown"})`,
+        );
+        if (webhook.kind === "payment" && webhook.event === "paid") {
+          await this.emitOrphanPaid(webhook);
+        }
+        return unsupported;
+      }
+
+      const sessionCredentials = this.credentialsForSession(session);
 
       const authenticated = verifyNiftipayWebhook({
         rawBody,
@@ -558,9 +782,14 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
       const webhookReference =
         webhook.order.merchantReference ?? webhook.order.reference;
+      const storedMerchantReference =
+        optionalString(sessionData.niftipay_merchant_reference) ?? session.id;
+      const referenceMatches =
+        webhookReference === session.id ||
+        webhookReference === storedMerchantReference;
       if (
-        (webhookReference && webhookReference !== session.id) ||
-        (webhook.event === "paid" && webhookReference !== session.id)
+        (webhookReference && !referenceMatches) ||
+        (webhook.event === "paid" && !referenceMatches)
       ) {
         this.logger_.error(
           `[niftipay] merchant reference mismatch for session ${session.id}`,

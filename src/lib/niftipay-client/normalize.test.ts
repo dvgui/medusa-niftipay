@@ -11,6 +11,8 @@ describe("normalizeNiftipayWebhook", () => {
           id: "fiat-order-id",
           integrationId: "peppys-integration-id",
           merchantReference: "payses_01M00JVM2YDY19TTT5D7FRGGHA",
+          email: "customer@example.com",
+          completedAt: "2026-08-17T07:39:56.092Z",
         },
       }),
     ).toEqual({
@@ -26,6 +28,9 @@ describe("normalizeNiftipayWebhook", () => {
         amountCents: undefined,
         subtotalCents: undefined,
         serviceFeePayer: undefined,
+        email: "customer@example.com",
+        completedAt: "2026-08-17T07:39:56.092Z",
+        updatedAt: undefined,
         reference: undefined,
       },
     })

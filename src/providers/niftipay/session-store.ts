@@ -95,6 +95,33 @@ export class NiftipaySessionStore {
     )
   }
 
+  async findByCartId(
+    cartId: string,
+    orderId?: string,
+  ): Promise<NiftipaySessionRow | null> {
+    const service = this.service()
+    if (!service?.list) return null
+
+    const sessions = await service.list(
+      { status: ["pending", "authorized", "captured"] },
+      { take: 100, order: { created_at: "DESC" }, select: FIELDS },
+    )
+    const cartSessions = sessions.filter(
+      (session) =>
+        String(session.provider_id ?? "").includes("niftipay") &&
+        String(session.data?.cart_id ?? "") === cartId,
+    )
+    if (orderId) {
+      return (
+        cartSessions.find(
+          (session) =>
+            String(session.data?.niftipay_order_id ?? "") === orderId,
+        ) ?? null
+      )
+    }
+    return cartSessions[0] ?? null
+  }
+
   async stamp(
     session: NiftipaySessionRow,
     patch: Record<string, unknown>,
