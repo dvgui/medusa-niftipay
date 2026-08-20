@@ -32,6 +32,7 @@ const brandOptions = {
   ...options,
   brandSettings: {
     buyreta_uk: {
+      apiKey: "buyreta-uk-api-key",
       integrationId: "buyreta-uk-integration-id",
       webhookSecret: ukSecret,
       returnUrl: "https://uk.example/payment-return/{cart_id}",
@@ -366,6 +367,9 @@ describe("Niftipay payment initiation", () => {
       unknown
     >;
     expect(body.integrationId).toBe("buyreta-uk-integration-id");
+    expect(requests[0].init?.headers).toEqual(
+      expect.objectContaining({ "x-api-key": "buyreta-uk-api-key" }),
+    );
     expect(body.returnUrl).toBe(`https://uk.example/payment-return/${cartId}`);
     expect(body).not.toHaveProperty("webhookSecret");
     expect(result.data).toEqual(
@@ -374,6 +378,48 @@ describe("Niftipay payment initiation", () => {
         niftipay_integration_id: "buyreta-uk-integration-id",
       }),
     );
+  });
+
+  it("uses the stored integration's API key for refund lookup and mutation", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({
+              order: refundableRemoteOrder({
+                integrationId: "buyreta-uk-integration-id",
+              }),
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      },
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      brandOptions,
+    );
+    await service.refundPayment({
+      amount: 2.5,
+      data: {
+        ...refundPaymentData,
+        niftipay_integration_id: "buyreta-uk-integration-id",
+      },
+    } as never);
+
+    expect(requests).toHaveLength(2);
+    for (const request of requests) {
+      expect(request.init?.headers).toEqual(
+        expect.objectContaining({ "x-api-key": "buyreta-uk-api-key" }),
+      );
+    }
   });
 });
 
@@ -528,6 +574,54 @@ describe("Niftipay fiat webhooks", () => {
         integrationId: "test-integration-id",
       }),
     });
+  });
+
+  it("uses the webhook integration's API key for orphan status lookup", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    const { emit, service } = buildWebhookService({
+      serviceOptions: brandOptions,
+      sessionExists: false,
+    });
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        return new Response(
+          JSON.stringify({
+            order: {
+              id: orderId,
+              integrationId: "buyreta-uk-integration-id",
+              orderKey: "33351",
+              merchantReference: cartId,
+              status: "completed",
+              currency: "GBP",
+              amountCents: 1000,
+              subtotalCents: 1000,
+              email: "customer@example.com",
+              completedAt: "2026-08-17T07:39:56.092Z",
+            },
+          }),
+          { status: 200 },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        ukSecret,
+        "buyreta-uk-integration-id",
+        cartId,
+      ) as never,
+    );
+
+    expect(emit).toHaveBeenCalled();
+    expect(requests).toHaveLength(1);
+    expect(requests[0].init?.headers).toEqual(
+      expect.objectContaining({ "x-api-key": "buyreta-uk-api-key" }),
+    );
   });
 
   it("does not attach an old paid attempt to a newer live session on the same cart", async () => {

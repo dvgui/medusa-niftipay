@@ -87,10 +87,24 @@ export default defineConfig({
 
 The checkout payment-session data must include `session_id` and `cart_id`. An
 optional `niftipay_brand_slug` (falling back to `brand_slug`) selects matching
-entries from `brandSettings`. Brand entries can override `integrationId` and
-`webhookSecret` as a required pair, allowing one Medusa backend to route
-separate storefront integrations while keeping callbacks and webhook
-authentication bound to the originating brand.
+entries from `brandSettings`. Brand entries can override `apiKey`, while
+`integrationId` and `webhookSecret` remain a required pair. This allows one
+Medusa backend to route storefronts across separate Niftipay accounts and
+integrations while keeping outbound API calls, callbacks, and webhook
+authentication bound to the originating brand. A brand without an `apiKey`
+override continues to use the provider-wide key.
+
+```ts
+brandSettings: {
+  peppys_uk: {
+    apiKey: process.env.BRAND_PEPPYS_UK_NIFTIPAY_API_KEY,
+    integrationId:
+      process.env.BRAND_PEPPYS_UK_NIFTIPAY_INTEGRATION_ID,
+    webhookSecret:
+      process.env.BRAND_PEPPYS_UK_NIFTIPAY_WEBHOOK_SECRET,
+  },
+}
+```
 
 ## Options
 
@@ -118,8 +132,10 @@ Return/failure URL templates support `{cart_id}` and `{session_id}`. All return
 and failure URLs must use HTTPS.
 
 Current fiat webhooks include `order.integrationId`. The provider resolves the
-webhook secret from that integration ID, authenticates the signature, and then
-requires it to match the integration stored on the Medusa payment session.
+API key and webhook secret from that integration ID, authenticates the
+signature, and then requires it to match the integration stored on the Medusa
+payment session. The API key is used only for the follow-up status lookup; it is
+never stored in payment-session data or logged.
 Legacy webhook payloads without `integrationId` fall back to the session's
 stored integration/brand credentials.
 

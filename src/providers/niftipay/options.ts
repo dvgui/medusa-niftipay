@@ -4,6 +4,7 @@ import type { NiftipayServiceFeePayer } from "../../lib/niftipay-client/types";
 import { isRecord, optionalString } from "../../lib/niftipay-client/utils";
 
 export type NiftipayBrandSettings = Readonly<{
+  apiKey?: string;
   integrationId?: string;
   webhookSecret?: string;
   returnUrl?: string;
@@ -12,6 +13,7 @@ export type NiftipayBrandSettings = Readonly<{
 }>;
 
 export type NiftipayResolvedCredentials = Readonly<{
+  apiKey: string;
   integrationId: string;
   webhookSecret: string;
   brandSlug?: string;
@@ -19,7 +21,7 @@ export type NiftipayResolvedCredentials = Readonly<{
 
 type NiftipayCredentialOptions = Pick<
   NiftipayProviderOptions,
-  "integrationId" | "webhookSecret" | "brandSettings"
+  "apiKey" | "integrationId" | "webhookSecret" | "brandSettings"
 >;
 
 export type NiftipayProviderOptions = Readonly<{
@@ -91,6 +93,7 @@ export const resolveNiftipayCredentialsForBrand = (
 ): NiftipayResolvedCredentials => {
   const brand = brandSlug ? options.brandSettings?.[brandSlug] : undefined;
   return {
+    apiKey: brand?.apiKey ?? options.apiKey,
     integrationId: brand?.integrationId ?? options.integrationId,
     webhookSecret: brand?.webhookSecret ?? options.webhookSecret,
     ...(brandSlug ? { brandSlug } : {}),
@@ -103,6 +106,7 @@ export const resolveNiftipayCredentialsForIntegration = (
 ): NiftipayResolvedCredentials | undefined => {
   if (integrationId === options.integrationId) {
     return {
+      apiKey: options.apiKey,
       integrationId: options.integrationId,
       webhookSecret: options.webhookSecret,
     };
@@ -116,6 +120,7 @@ export const resolveNiftipayCredentialsForIntegration = (
       settings.webhookSecret
     ) {
       return {
+        apiKey: settings.apiKey ?? options.apiKey,
         integrationId,
         webhookSecret: settings.webhookSecret,
         brandSlug,
@@ -162,6 +167,15 @@ export const validateNiftipayOptions = (
 
     const integrationId = optionalString(candidate.integrationId);
     const webhookSecret = optionalString(candidate.webhookSecret);
+    if (
+      Object.prototype.hasOwnProperty.call(candidate, "apiKey") &&
+      !optionalString(candidate.apiKey)
+    ) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `Niftipay brandSettings.${brandSlug}.apiKey must be a non-empty string`,
+      );
+    }
     if (Boolean(integrationId) !== Boolean(webhookSecret)) {
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,

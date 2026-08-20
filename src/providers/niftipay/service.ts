@@ -47,6 +47,7 @@ import {
 } from "../../lib/niftipay-client/utils";
 import { verifyNiftipayWebhook } from "../../lib/niftipay-client/webhook";
 import {
+  type NiftipayResolvedCredentials,
   type NiftipayProviderOptions,
   type ResolvedNiftipayOptions,
   resolveNiftipayCredentialsForBrand,
@@ -222,7 +223,6 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
   protected logger_: Logger;
   protected options_: ResolvedNiftipayOptions;
-  private readonly client_: NiftipayClient;
   private readonly store_: NiftipaySessionStore;
   private readonly container_: InjectedDependencies;
   private readonly verifiedSessions_ = new Map<string, number>();
@@ -239,12 +239,37 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     this.logger_ = container.logger;
     this.container_ = container;
     this.options_ = withDefaults(options);
-    this.client_ = new NiftipayClient({
-      apiKey: options.apiKey,
-      baseUrl: this.options_.baseUrl,
-      allowedRedirectHosts: options.allowedRedirectHosts,
-    });
     this.store_ = new NiftipaySessionStore(container, container.logger);
+  }
+
+  private clientForCredentials(
+    credentials: NiftipayResolvedCredentials,
+  ): NiftipayClient {
+    return new NiftipayClient({
+      apiKey: credentials.apiKey,
+      baseUrl: this.options_.baseUrl,
+      allowedRedirectHosts: this.options_.allowedRedirectHosts,
+    });
+  }
+
+  private credentialsForData(
+    data: Record<string, unknown>,
+  ): NiftipayResolvedCredentials {
+    const storedIntegrationId = optionalString(
+      data.niftipay_integration_id,
+    );
+    if (storedIntegrationId) {
+      const storedCredentials = resolveNiftipayCredentialsForIntegration(
+        this.options_,
+        storedIntegrationId,
+      );
+      if (storedCredentials) return storedCredentials;
+    }
+
+    return resolveNiftipayCredentialsForBrand(
+      this.options_,
+      optionalString(data.brand_slug),
+    );
   }
 
   private isRecentlyVerified(sessionId: string): boolean {
@@ -368,7 +393,9 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     };
 
     try {
-      const created = await this.client_.createFiatOrder(payload);
+      const created = await this.clientForCredentials(
+        credentials,
+      ).createFiatOrder(payload);
       if (
         created.reference &&
         created.reference !== sessionId &&
@@ -445,6 +472,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
   private async resolveRefundOrder(
     data: Record<string, unknown>,
+    client: NiftipayClient,
   ): Promise<RefundableNiftipayOrder> {
     const storedOrderId = optionalString(data.niftipay_order_id);
     const storedOrderKey = optionalString(data.niftipay_order_key);
@@ -463,7 +491,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     let lookupError: unknown;
     for (const candidate of candidates) {
       try {
-        remote = await this.client_.retrieveNormalizedFiatOrder(candidate);
+        remote = await client.retrieveNormalizedFiatOrder(candidate);
         break;
       } catch (error: unknown) {
         lookupError = error;
@@ -497,11 +525,12 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       );
     }
 
-    const remote = await this.resolveRefundOrder(data);
+    const client = this.clientForCredentials(this.credentialsForData(data));
+    const remote = await this.resolveRefundOrder(data, client);
     const identifier = remote.orderKey;
     const amountCents = toMinorUnits(amount, currency);
     try {
-      await this.client_.createFiatRefund(identifier, {
+      await client.createFiatRefund(identifier, {
         amountCents,
         description: `Medusa refund for ${optionalString(data.session_id) ?? identifier}`,
       });
@@ -533,7 +562,9 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     const identifier = optionalString(data.niftipay_order_key);
     if (!identifier) return { data };
 
-    const remote = await this.client_.retrieveNormalizedFiatOrder(identifier);
+    const remote = await this.clientForCredentials(
+      this.credentialsForData(data),
+    ).retrieveNormalizedFiatOrder(identifier);
     return {
       data: {
         ...data,
@@ -607,22 +638,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
   }
 
   private credentialsForSession(session: NiftipaySessionRow) {
-    const storedIntegrationId = optionalString(
-      session.data?.niftipay_integration_id,
-    );
-    if (storedIntegrationId) {
-      const storedCredentials = resolveNiftipayCredentialsForIntegration(
-        this.options_,
-        storedIntegrationId,
-      );
-      if (storedCredentials) return storedCredentials;
-    }
-
-    const brandSlug = optionalString(session.data?.brand_slug);
-    return resolveNiftipayCredentialsForBrand(
-      this.options_,
-      brandSlug,
-    );
+    return this.credentialsForData(session.data ?? {});
   }
 
   /**
@@ -632,6 +648,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
    */
   private async emitOrphanPaid(
     webhook: NiftipayPaymentWebhook,
+    credentials: NiftipayResolvedCredentials,
   ): Promise<boolean> {
     const signed = webhook.order;
     const cartId = signed.merchantReference;
@@ -652,7 +669,9 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
     let canonical: NiftipayRemoteOrder = signed;
     try {
-      const remote = await this.client_.retrieveNormalizedFiatOrder(signed.id);
+      const remote = await this.clientForCredentials(
+        credentials,
+      ).retrieveNormalizedFiatOrder(signed.id);
       if (!remote.id || remote.id !== signed.id) {
         this.logger_.error(
           `[niftipay] orphan status lookup returned a different public order ID for ${signed.id}`,
@@ -842,7 +861,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
           `[niftipay] ${event} webhook has no live payment session (orderId=${orderId ?? "unknown"})`,
         );
         if (webhook.kind === "payment" && webhook.event === "paid") {
-          await this.emitOrphanPaid(webhook);
+          await this.emitOrphanPaid(webhook, webhookCredentials);
         }
         return unsupported;
       }
