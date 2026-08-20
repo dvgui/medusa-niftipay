@@ -153,6 +153,21 @@ durable cart identifier.
 including zero- and three-decimal currencies. It supports partial and multiple
 refund requests.
 
+Before that single mutation, the provider performs an authenticated read-only
+lookup using the stored public order UUID first and the stored order key as a
+fallback. It uses the lookup's canonical order key only after matching the
+public UUID, integration, currency, and merchant/cart reference to Medusa's
+captured payment and confirming that Niftipay exposes a PSP order/transaction
+record. This recovers a stale internal key without ever guessing which payment
+to refund. Lookup failures may fall back to the other stored identifier; a
+refund POST is never retried under another identifier because an HTTP failure
+can be ambiguous after a processor-side mutation.
+
+If the preflight reports that the PSP order or transaction record is missing,
+the condition is upstream of Medusa. Give Niftipay support the public order UUID
+and canonical order key; Medusa cannot safely manufacture that processor
+record or bypass it with a second mutation.
+
 ## Development
 
 ```bash

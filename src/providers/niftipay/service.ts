@@ -40,6 +40,7 @@ import type {
   NormalizedNiftipayWebhook,
 } from "../../lib/niftipay-client/types";
 import {
+  getErrorMessage,
   isRecord,
   optionalNumber,
   optionalString,
@@ -145,6 +146,69 @@ type NiftipayPaymentWebhook = Extract<
   NormalizedNiftipayWebhook,
   { kind: "payment" }
 >;
+
+type RefundableNiftipayOrder = NiftipayRemoteOrder &
+  Readonly<{
+    orderKey: string;
+    pspOrderId: string;
+  }>;
+
+const refundOrderMatchesPayment = (
+  data: Record<string, unknown>,
+  remote: NiftipayRemoteOrder,
+): boolean => {
+  const storedOrderId = optionalString(data.niftipay_order_id);
+  const storedIntegrationId = optionalString(
+    data.niftipay_integration_id,
+  );
+  const storedCurrency = optionalString(
+    data.niftipay_currency,
+  )?.toUpperCase();
+  const storedMerchantReference = optionalString(
+    data.niftipay_merchant_reference,
+  );
+
+  return !(
+    (storedOrderId && remote.id !== storedOrderId) ||
+    (storedIntegrationId &&
+      remote.integrationId !== storedIntegrationId) ||
+    (storedCurrency && remote.currency !== storedCurrency) ||
+    (storedMerchantReference &&
+      remote.merchantReference !== storedMerchantReference)
+  );
+};
+
+const requireRefundableOrder = (
+  remote: NiftipayRemoteOrder,
+): RefundableNiftipayOrder => {
+  if (!remote.orderKey) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Niftipay refund target has no canonical order key",
+    );
+  }
+  if (!remote.pspOrderId) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Niftipay has no processor order record for this payment; contact Niftipay support with the public order ID and order key",
+    );
+  }
+  if (
+    remote.pspTransactionCount !== undefined &&
+    remote.pspTransactionCount <= 0
+  ) {
+    throw new MedusaError(
+      MedusaError.Types.UNEXPECTED_STATE,
+      "Niftipay has no processor transaction record for this payment; contact Niftipay support with the public order ID and order key",
+    );
+  }
+
+  return {
+    ...remote,
+    orderKey: remote.orderKey,
+    pspOrderId: remote.pspOrderId,
+  };
+};
 
 type EventBusService = {
   emit(input: {
@@ -379,26 +443,83 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     return { data: paymentData(input.data) };
   }
 
-  async refundPayment(input: RefundPaymentInput): Promise<RefundPaymentOutput> {
-    const data = paymentData(input.data);
-    const identifier = optionalString(data.niftipay_order_key);
-    const amount = numberValue(input.amount);
-    const currency = optionalString(data.niftipay_currency);
-    if (!identifier || amount === undefined || !currency) {
+  private async resolveRefundOrder(
+    data: Record<string, unknown>,
+  ): Promise<RefundableNiftipayOrder> {
+    const storedOrderId = optionalString(data.niftipay_order_id);
+    const storedOrderKey = optionalString(data.niftipay_order_key);
+    const candidates = [...new Set([storedOrderId, storedOrderKey])].filter(
+      (candidate): candidate is string => Boolean(candidate),
+    );
+
+    if (candidates.length === 0) {
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,
-        "Niftipay order key, refund amount, and currency are required",
+        "Niftipay public order ID or order key is required for refund",
       );
     }
 
+    let remote: NiftipayRemoteOrder | undefined;
+    let lookupError: unknown;
+    for (const candidate of candidates) {
+      try {
+        remote = await this.client_.retrieveNormalizedFiatOrder(candidate);
+        break;
+      } catch (error: unknown) {
+        lookupError = error;
+      }
+    }
+
+    if (!remote) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        `Niftipay could not resolve the stored refund target: ${getErrorMessage(lookupError)}`,
+      );
+    }
+
+    if (!refundOrderMatchesPayment(data, remote)) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        "Niftipay refund target does not match the captured Medusa payment",
+      );
+    }
+    return requireRefundableOrder(remote);
+  }
+
+  async refundPayment(input: RefundPaymentInput): Promise<RefundPaymentOutput> {
+    const data = paymentData(input.data);
+    const amount = numberValue(input.amount);
+    const currency = optionalString(data.niftipay_currency);
+    if (amount === undefined || !currency) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Niftipay refund amount and currency are required",
+      );
+    }
+
+    const remote = await this.resolveRefundOrder(data);
+    const identifier = remote.orderKey;
     const amountCents = toMinorUnits(amount, currency);
-    await this.client_.createFiatRefund(identifier, {
-      amountCents,
-      description: `Medusa refund for ${optionalString(data.session_id) ?? identifier}`,
-    });
+    try {
+      await this.client_.createFiatRefund(identifier, {
+        amountCents,
+        description: `Medusa refund for ${optionalString(data.session_id) ?? identifier}`,
+      });
+    } catch (error: unknown) {
+      throw new MedusaError(
+        MedusaError.Types.UNEXPECTED_STATE,
+        `Niftipay refund request failed for order ${remote.id ?? identifier}: ${getErrorMessage(error)}`,
+      );
+    }
     return {
       data: {
         ...data,
+        ...(remote.id ? { niftipay_order_id: remote.id } : {}),
+        niftipay_order_key: identifier,
+        niftipay_psp_order_id: remote.pspOrderId,
+        ...(remote.pspStatus
+          ? { niftipay_psp_status: remote.pspStatus }
+          : {}),
         niftipay_status: "refund_requested",
         niftipay_last_refund_amount: amount,
       },

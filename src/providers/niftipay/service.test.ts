@@ -40,6 +40,30 @@ const brandOptions = {
   },
 };
 
+const refundPaymentData = {
+  session_id: sessionId,
+  niftipay_order_id: orderId,
+  niftipay_order_key: "legacy-stored-key",
+  niftipay_integration_id: "test-integration-id",
+  niftipay_merchant_reference: cartId,
+  niftipay_currency: "GBP",
+};
+
+const refundableRemoteOrder = (
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> => ({
+  id: orderId,
+  orderKey: 33351,
+  integrationId: "test-integration-id",
+  merchantReference: cartId,
+  currency: "GBP",
+  status: "completed",
+  pspOrderId: "processor-order-id",
+  pspStatus: "completed",
+  pspTransactionCount: 1,
+  ...overrides,
+});
+
 afterEach(() => {
   globalThis.fetch = originalFetch;
 });
@@ -127,7 +151,7 @@ describe("Niftipay payment initiation", () => {
     );
   });
 
-  it("uses Niftipay's partial-refund endpoint and minor units", async () => {
+  it("preflights the public order ID and refunds the canonical key once", async () => {
     const requests: Array<{
       input: string | URL | Request;
       init?: RequestInit;
@@ -135,6 +159,67 @@ describe("Niftipay payment initiation", () => {
     globalThis.fetch = mock(
       async (input: string | URL | Request, init?: RequestInit) => {
         requests.push({ input, init });
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({ order: refundableRemoteOrder() }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      },
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    const result = await service.refundPayment({
+      amount: 2.5,
+      data: refundPaymentData,
+    } as never);
+
+    expect(requests).toHaveLength(2);
+    expect(requests[0].init?.method).toBe("GET");
+    expect(String(requests[0].input)).toEndWith(
+      `/api/fiat/orders/${orderId}`,
+    );
+    expect(requests[1].init?.method).toBe("POST");
+    expect(String(requests[1].input)).toEndWith(
+      "/api/fiat/orders/33351/refunds",
+    );
+    expect(JSON.parse(String(requests[1].init?.body))).toEqual({
+      amountCents: 250,
+      description: `Medusa refund for ${sessionId}`,
+    });
+    expect(result.data).toEqual(
+      expect.objectContaining({
+        niftipay_order_id: orderId,
+        niftipay_order_key: "33351",
+        niftipay_status: "refund_requested",
+        niftipay_last_refund_amount: 2.5,
+      }),
+    );
+  });
+
+  it("falls back to the stored key for a read-only lookup before one refund POST", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        if (init?.method === "GET" && String(input).endsWith(`/${orderId}`)) {
+          return new Response(JSON.stringify({ message: "Not found" }), {
+            status: 404,
+          });
+        }
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({ order: refundableRemoteOrder() }),
+            { status: 200 },
+          );
+        }
         return new Response(JSON.stringify({ ok: true }), { status: 201 });
       },
     ) as unknown as typeof fetch;
@@ -145,21 +230,101 @@ describe("Niftipay payment initiation", () => {
     );
     await service.refundPayment({
       amount: 2.5,
-      data: {
-        session_id: sessionId,
-        niftipay_order_key: "33351",
-        niftipay_currency: "GBP",
-      },
+      data: refundPaymentData,
     } as never);
 
-    expect(String(requests[0].input)).toEndWith(
+    expect(requests.map(({ init }) => init?.method)).toEqual([
+      "GET",
+      "GET",
+      "POST",
+    ]);
+    expect(String(requests[1].input)).toEndWith(
+      "/api/fiat/orders/legacy-stored-key",
+    );
+    expect(String(requests[2].input)).toEndWith(
       "/api/fiat/orders/33351/refunds",
     );
-    expect(JSON.parse(String(requests[0].init?.body))).toEqual({
-      amountCents: 250,
-      description: `Medusa refund for ${sessionId}`,
-    });
   });
+
+  it("never retries an ambiguous refund mutation under another identifier", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({ order: refundableRemoteOrder() }),
+            { status: 200 },
+          );
+        }
+        return new Response(
+          JSON.stringify({ message: "Processor transaction unavailable" }),
+          { status: 500 },
+        );
+      },
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    await expect(
+      service.refundPayment({
+        amount: 2.5,
+        data: refundPaymentData,
+      } as never),
+    ).rejects.toThrow("Processor transaction unavailable");
+
+    expect(requests.map(({ init }) => init?.method)).toEqual(["GET", "POST"]);
+    expect(String(requests[1].input)).toEndWith(
+      "/api/fiat/orders/33351/refunds",
+    );
+  });
+
+  it.each([
+    ["public order ID", { id: "different-order-id" }],
+    ["integration", { integrationId: "different-integration" }],
+    ["currency", { currency: "EUR" }],
+    ["merchant reference", { merchantReference: "cart_different" }],
+    ["PSP order", { pspOrderId: undefined }],
+    ["PSP transaction", { pspTransactionCount: 0 }],
+  ])(
+    "rejects a mismatched or incomplete %s before refunding",
+    async (_, remoteOverrides) => {
+      const requests: Array<{
+        input: string | URL | Request;
+        init?: RequestInit;
+      }> = [];
+      globalThis.fetch = mock(
+        async (input: string | URL | Request, init?: RequestInit) => {
+          requests.push({ input, init });
+          return new Response(
+            JSON.stringify({
+              order: refundableRemoteOrder(remoteOverrides),
+            }),
+            { status: 200 },
+          );
+        },
+      ) as unknown as typeof fetch;
+
+      const service = new NiftipayPaymentProviderService(
+        { logger: logger() } as never,
+        options,
+      );
+      await expect(
+        service.refundPayment({
+          amount: 2.5,
+          data: refundPaymentData,
+        } as never),
+      ).rejects.toThrow();
+
+      expect(requests).toHaveLength(1);
+      expect(requests[0].init?.method).toBe("GET");
+    },
+  );
 
   it("selects a brand-specific integration without exposing its webhook secret", async () => {
     const requests: Array<{

@@ -29,6 +29,9 @@ export const normalizeNiftipayOrder = (
     subtotalCents: optionalNumber(value.subtotalCents),
     serviceFeePayer: optionalString(value.serviceFeePayer),
     email: optionalString(value.email),
+    pspOrderId: optionalString(value.pspOrderId),
+    pspStatus: optionalString(value.pspStatus)?.toLowerCase(),
+    pspTransactionCount: optionalNumber(value.pspTransactionCount),
     completedAt: optionalString(value.completedAt),
     updatedAt: optionalString(value.updatedAt),
   }

@@ -49,6 +49,9 @@ export type NiftipayRemoteOrder = Readonly<{
   subtotalCents?: number
   serviceFeePayer?: string
   email?: string
+  pspOrderId?: string
+  pspStatus?: string
+  pspTransactionCount?: number
   completedAt?: string
   updatedAt?: string
 }>

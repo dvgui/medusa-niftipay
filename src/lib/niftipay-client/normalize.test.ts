@@ -1,6 +1,29 @@
 import { describe, expect, it } from "bun:test"
 
-import { normalizeNiftipayWebhook } from "./normalize"
+import {
+  normalizeNiftipayOrder,
+  normalizeNiftipayWebhook,
+} from "./normalize"
+
+describe("normalizeNiftipayOrder", () => {
+  it("preserves the PSP fields required to preflight a refund", () => {
+    expect(
+      normalizeNiftipayOrder({
+        id: "fiat-order-id",
+        orderKey: 33351,
+        pspOrderId: "  processor-order-id  ",
+        pspStatus: "COMPLETED",
+        pspTransactionCount: "1",
+      }),
+    ).toMatchObject({
+      id: "fiat-order-id",
+      orderKey: "33351",
+      pspOrderId: "processor-order-id",
+      pspStatus: "completed",
+      pspTransactionCount: 1,
+    })
+  })
+})
 
 describe("normalizeNiftipayWebhook", () => {
   it("preserves the fiat integration ID used for project routing", () => {
