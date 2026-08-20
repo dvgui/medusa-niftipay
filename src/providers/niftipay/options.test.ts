@@ -73,6 +73,21 @@ describe("Niftipay credential resolution", () => {
     ).toThrow("brandSettings.peppys_uk.apiKey must be a non-empty string")
   })
 
+  it("rejects a brand API key without its integration credential pair", () => {
+    expect(() =>
+      validateNiftipayOptions({
+        ...options,
+        brandSettings: {
+          peppys_uk: {
+            apiKey: "peppys-api-key",
+          },
+        },
+      }),
+    ).toThrow(
+      "brandSettings.peppys_uk must configure apiKey with integrationId and webhookSecret",
+    )
+  })
+
   it("rejects one integration ID being assigned to multiple stores", () => {
     expect(() =>
       validateNiftipayOptions({

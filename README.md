@@ -88,7 +88,8 @@ export default defineConfig({
 The checkout payment-session data must include `session_id` and `cart_id`. An
 optional `niftipay_brand_slug` (falling back to `brand_slug`) selects matching
 entries from `brandSettings`. Brand entries can override `apiKey`, while
-`integrationId` and `webhookSecret` remain a required pair. This allows one
+`integrationId` and `webhookSecret` remain a required pair; an API-key override
+must be configured with that pair. This allows one
 Medusa backend to route storefronts across separate Niftipay accounts and
 integrations while keeping outbound API calls, callbacks, and webhook
 authentication bound to the originating brand. A brand without an `apiKey`

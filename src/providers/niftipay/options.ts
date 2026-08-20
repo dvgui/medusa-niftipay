@@ -165,6 +165,7 @@ export const validateNiftipayOptions = (
       );
     }
 
+    const apiKey = optionalString(candidate.apiKey);
     const integrationId = optionalString(candidate.integrationId);
     const webhookSecret = optionalString(candidate.webhookSecret);
     if (
@@ -174,6 +175,12 @@ export const validateNiftipayOptions = (
       throw new MedusaError(
         MedusaError.Types.INVALID_DATA,
         `Niftipay brandSettings.${brandSlug}.apiKey must be a non-empty string`,
+      );
+    }
+    if (apiKey && (!integrationId || !webhookSecret)) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        `Niftipay brandSettings.${brandSlug} must configure apiKey with integrationId and webhookSecret`,
       );
     }
     if (Boolean(integrationId) !== Boolean(webhookSecret)) {
