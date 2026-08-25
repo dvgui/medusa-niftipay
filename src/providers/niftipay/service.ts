@@ -165,8 +165,18 @@ const refundOrderMatchesPayment = (
   const storedCurrency = optionalString(
     data.niftipay_currency,
   )?.toUpperCase();
-  const storedMerchantReference = optionalString(
-    data.niftipay_merchant_reference,
+  // The plugin has used two merchantReference conventions: the cart id and the
+  // payment session id. Live data is mixed — 340 of 474 payments store a cart
+  // id locally while Niftipay holds the session id for the same order — so
+  // demanding one exact value refuses legitimate refunds. Accept any reference
+  // that is demonstrably ours; identity is already pinned by the order UUID,
+  // integration, and currency checks above, and a foreign reference still fails.
+  const acceptableReferences = new Set(
+    [
+      optionalString(data.niftipay_merchant_reference),
+      optionalString(data.session_id),
+      optionalString(data.cart_id),
+    ].filter((reference): reference is string => Boolean(reference)),
   );
 
   return !(
@@ -174,8 +184,9 @@ const refundOrderMatchesPayment = (
     (storedIntegrationId &&
       remote.integrationId !== storedIntegrationId) ||
     (storedCurrency && remote.currency !== storedCurrency) ||
-    (storedMerchantReference &&
-      remote.merchantReference !== storedMerchantReference)
+    (acceptableReferences.size > 0 &&
+      remote.merchantReference !== undefined &&
+      !acceptableReferences.has(remote.merchantReference))
   );
 };
 

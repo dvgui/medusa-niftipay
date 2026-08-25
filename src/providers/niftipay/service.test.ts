@@ -192,6 +192,45 @@ describe("Niftipay payment initiation", () => {
     );
   });
 
+  // Production stores the CART id locally while Niftipay holds the SESSION id
+  // for the same order. Both are ours; refusing that combination blocked
+  // refunds on the majority of live payments.
+  it("refunds when Niftipay holds the session id and we stored the cart id", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({
+              order: refundableRemoteOrder({ merchantReference: sessionId }),
+            }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      },
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    await service.refundPayment({
+      amount: { value: "12.34", precision: 20 },
+      data: refundPaymentData,
+    } as never);
+
+    expect(requests[1].init?.method).toBe("POST");
+    expect(JSON.parse(String(requests[1].init?.body))).toEqual({
+      amountCents: 1234,
+      description: `Medusa refund for ${sessionId}`,
+    });
+  });
+
   it("preflights the public order ID and refunds the canonical key once", async () => {
     const requests: Array<{
       input: string | URL | Request;
