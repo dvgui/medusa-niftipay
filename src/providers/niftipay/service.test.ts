@@ -152,6 +152,46 @@ describe("Niftipay payment initiation", () => {
     );
   });
 
+  // Medusa's payment module passes `refund.raw_amount`, NOT a plain number:
+  // a { value, precision } object. Number() makes that NaN, which the provider
+  // read as "no amount" and rejected — every admin refund 400'd with
+  // "Niftipay refund amount and currency are required". Keep this shape here.
+  it("accepts the raw BigNumber amount the payment module actually sends", async () => {
+    const requests: Array<{
+      input: string | URL | Request;
+      init?: RequestInit;
+    }> = [];
+    globalThis.fetch = mock(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        requests.push({ input, init });
+        if (init?.method === "GET") {
+          return new Response(
+            JSON.stringify({ order: refundableRemoteOrder() }),
+            { status: 200 },
+          );
+        }
+        return new Response(JSON.stringify({ ok: true }), { status: 201 });
+      },
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    const result = await service.refundPayment({
+      amount: { value: "93.67", precision: 20 },
+      data: refundPaymentData,
+    } as never);
+
+    expect(JSON.parse(String(requests[1].init?.body))).toEqual({
+      amountCents: 9367,
+      description: `Medusa refund for ${sessionId}`,
+    });
+    expect(result.data).toEqual(
+      expect.objectContaining({ niftipay_last_refund_amount: 93.67 }),
+    );
+  });
+
   it("preflights the public order ID and refunds the canonical key once", async () => {
     const requests: Array<{
       input: string | URL | Request;

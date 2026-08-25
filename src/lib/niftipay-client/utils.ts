@@ -9,8 +9,31 @@ export const optionalString = (value: unknown): string | undefined => {
   return undefined
 }
 
+/**
+ * Coerce a value to a finite number, understanding Medusa's BigNumber shapes.
+ *
+ * Medusa hands money amounts to providers as `BigNumberInput`. A BigNumber
+ * INSTANCE survives `Number()` through its `valueOf()`, but the payment module
+ * passes `refund.raw_amount` / `capture.raw_amount` — the plain
+ * `{ value, precision }` row shape, which `Number()` turns into NaN. Treating
+ * that as "no amount given" made every admin refund fail with
+ * "Niftipay refund amount and currency are required".
+ */
 export const optionalNumber = (value: unknown): number | undefined => {
-  const numeric = typeof value === "number" ? value : Number(value)
+  if (typeof value === "number") {
+    return Number.isFinite(value) ? value : undefined
+  }
+
+  if (isRecord(value)) {
+    // Medusa BigNumber instance.
+    if (typeof value.numeric === "number" && Number.isFinite(value.numeric)) {
+      return value.numeric
+    }
+    // Raw { value, precision } row shape.
+    if ("value" in value) return optionalNumber(value.value)
+  }
+
+  const numeric = Number(value)
   return Number.isFinite(numeric) ? numeric : undefined
 }
 
