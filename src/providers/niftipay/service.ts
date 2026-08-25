@@ -62,6 +62,7 @@ type InjectedDependencies = { logger: Logger; [key: string]: unknown };
 type NiftipaySessionData = Readonly<{
   session_id: string;
   cart_id: string;
+  niftipay_attempt_id?: string;
   brand_slug?: string;
   niftipay_order_id: string;
   niftipay_order_key: string;
@@ -176,6 +177,7 @@ const refundOrderMatchesPayment = (
       optionalString(data.niftipay_merchant_reference),
       optionalString(data.session_id),
       optionalString(data.cart_id),
+      optionalString(data.niftipay_attempt_id),
     ].filter((reference): reference is string => Boolean(reference)),
   );
 
@@ -228,6 +230,12 @@ type EventBusService = {
     data: Record<string, unknown>;
   }): Promise<unknown>;
 };
+
+/** Infrastructure failures must escape the provider so Medusa retries the
+ * queued webhook instead of acknowledging a paid event as unsupported. */
+class RetryableNiftipayWebhookError extends Error {
+  override name = "RetryableNiftipayWebhookError";
+}
 
 class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayProviderOptions> {
   static identifier = "niftipay";
@@ -357,6 +365,13 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     toMinorUnits(amount, currency);
 
     const serviceFeePayer = this.options_.serviceFeePayer;
+    const attemptId = optionalString(data.niftipay_attempt_id);
+    if (attemptId && !/^npat_[A-Za-z0-9]+$/.test(attemptId)) {
+      throw new MedusaError(
+        MedusaError.Types.INVALID_DATA,
+        "Niftipay payment attempt ID is invalid",
+      );
+    }
     const brandSlug =
       optionalString(data.niftipay_brand_slug) ??
       optionalString(data.brand_slug);
@@ -387,17 +402,18 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       brandSettings?.descriptionTemplate ?? this.options_.descriptionTemplate,
       { cartId, sessionId, brandSlug, customerName },
     );
+    // Send the durable attempt in BOTH fields. Production data has shown that
+    // Niftipay can echo `reference` as merchantReference, even when a different
+    // merchantReference was submitted. One durable value removes ambiguity.
+    const durableReference = attemptId ?? cartId;
     const payload: NiftipayFiatOrderPayload = {
       integrationId,
       currency,
       amount,
       email,
       description,
-      reference: sessionId,
-      // Medusa intentionally hard-deletes payment sessions whenever a cart's
-      // total changes. The cart ID survives that lifecycle and lets a verified
-      // late-paid webhook recover the exact checkout.
-      merchantReference: cartId,
+      reference: durableReference,
+      merchantReference: durableReference,
       serviceFeePayer,
       ...(returnUrl ? { returnUrl } : {}),
       ...(failureUrl ? { failureUrl } : {}),
@@ -407,22 +423,25 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       const created = await this.clientForCredentials(
         credentials,
       ).createFiatOrder(payload);
+      const acceptableReturnedReferences = attemptId
+        ? new Set([durableReference])
+        : new Set([durableReference, sessionId, cartId]);
       if (
         created.reference &&
-        created.reference !== sessionId &&
-        created.reference !== cartId
+        !acceptableReturnedReferences.has(created.reference)
       ) {
         throw new Error("Niftipay returned a different merchant reference");
       }
       const sessionData: NiftipaySessionData = {
         session_id: sessionId,
         cart_id: cartId,
+        ...(attemptId ? { niftipay_attempt_id: attemptId } : {}),
         ...(brandSlug ? { brand_slug: brandSlug } : {}),
         niftipay_order_id: created.orderId,
         niftipay_order_key: created.orderKey,
         niftipay_redirect_url: created.payUrl,
-        niftipay_reference: sessionId,
-        niftipay_merchant_reference: cartId,
+        niftipay_reference: durableReference,
+        niftipay_merchant_reference: durableReference,
         niftipay_description: description,
         niftipay_integration_id: integrationId,
         niftipay_status: created.status ?? "created",
@@ -645,6 +664,13 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       );
       if (session) return session;
     }
+    if (merchantReference?.startsWith("npat_")) {
+      const session = await this.store_.findByAttemptId(
+        merchantReference,
+        orderId,
+      );
+      if (session) return session;
+    }
     return orderKey ? this.store_.findByOrderKey(orderKey) : null;
   }
 
@@ -654,19 +680,26 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
   /**
    * Emits an app-owned recovery event only after the webhook has passed the
-   * integration-bound HMAC check. The remote status lookup is a second check;
-   * signed webhook data remains the fallback during a temporary API outage.
+   * integration-bound HMAC check. The remote status lookup is mandatory; an
+   * outage throws so Medusa's queued webhook retries instead of accepting an
+   * unverified recovery.
    */
   private async emitOrphanPaid(
     webhook: NiftipayPaymentWebhook,
     credentials: NiftipayResolvedCredentials,
   ): Promise<boolean> {
     const signed = webhook.order;
-    const cartId = signed.merchantReference;
-    if (webhook.event !== "paid" || !cartId?.startsWith("cart_")) {
+    const durableReference = signed.merchantReference ?? signed.reference;
+    const cartId = durableReference?.startsWith("cart_")
+      ? durableReference
+      : undefined;
+    const attemptId = durableReference?.startsWith("npat_")
+      ? durableReference
+      : undefined;
+    if (webhook.event !== "paid" || (!cartId && !attemptId)) {
       if (webhook.event === "paid") {
         this.logger_.error(
-          `[niftipay] authenticated orphan paid webhook has no durable cart reference (orderId=${signed.id ?? "unknown"}, reference=${cartId ?? "unknown"}); manual recovery required`,
+          `[niftipay] authenticated orphan paid webhook has no durable reference (orderId=${signed.id ?? "unknown"}, reference=${durableReference ?? "unknown"}); manual recovery required`,
         );
       }
       return false;
@@ -690,16 +723,16 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         return false;
       }
       if (!["completed", "paid"].includes(remote.status ?? "")) {
-        this.logger_.error(
-          `[niftipay] orphan status lookup is not completed for ${signed.id} (status=${remote.status ?? "unknown"})`,
+        throw new RetryableNiftipayWebhookError(
+          `Niftipay status lookup is not completed for ${signed.id} (status=${remote.status ?? "unknown"})`,
         );
-        return false;
       }
       canonical = remote;
     } catch (error: unknown) {
+      if (error instanceof RetryableNiftipayWebhookError) throw error;
       const message = error instanceof Error ? error.message : String(error);
-      this.logger_.warn(
-        `[niftipay] orphan status lookup failed for ${signed.id}; using authenticated webhook fields: ${message}`,
+      throw new RetryableNiftipayWebhookError(
+        `Niftipay orphan status lookup failed for ${signed.id}: ${message}`,
       );
     }
 
@@ -714,7 +747,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     }
     if (
       canonical.merchantReference &&
-      canonical.merchantReference !== cartId
+      canonical.merchantReference !== durableReference
     ) {
       this.logger_.error(
         `[niftipay] orphan merchant reference mismatch for ${signed.id}`,
@@ -772,33 +805,40 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       "__event_bus__",
     ]);
     if (!eventBus) {
-      this.logger_.error(
-        `[niftipay] event bus unavailable; cannot recover orphan ${signed.id}`,
+      throw new RetryableNiftipayWebhookError(
+        `Niftipay event bus unavailable for orphan ${signed.id}`,
       );
-      return false;
     }
 
-    await eventBus.emit({
-      name: "payment.niftipay_orphan_paid",
-      data: {
-        cartId,
-        niftipayOrderId: signed.id,
-        ...(canonical.orderKey ?? signed.orderKey
-          ? { niftipayOrderKey: canonical.orderKey ?? signed.orderKey }
-          : {}),
-        merchantReference: cartId,
-        amountMinor,
-        currencyCode: currency,
-        customerEmail,
-        capturedAtIso,
-        integrationId: signed.integrationId,
-        ...(signed.reference?.startsWith("payses_")
-          ? { missingSessionId: signed.reference }
-          : {}),
-      },
-    });
+    try {
+      await eventBus.emit({
+        name: "payment.niftipay_orphan_paid",
+        data: {
+          ...(cartId ? { cartId } : {}),
+          ...(attemptId ? { attemptId } : {}),
+          niftipayOrderId: signed.id,
+          ...(canonical.orderKey ?? signed.orderKey
+            ? { niftipayOrderKey: canonical.orderKey ?? signed.orderKey }
+            : {}),
+          merchantReference: durableReference,
+          amountMinor,
+          currencyCode: currency,
+          customerEmail,
+          capturedAtIso,
+          integrationId: signed.integrationId,
+          ...(signed.reference?.startsWith("payses_")
+            ? { missingSessionId: signed.reference }
+            : {}),
+        },
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      throw new RetryableNiftipayWebhookError(
+        `Niftipay orphan event dispatch failed for ${signed.id}: ${message}`,
+      );
+    }
     this.logger_.warn(
-      `[niftipay] emitted payment.niftipay_orphan_paid for order ${signed.id} cart=${cartId}`,
+      `[niftipay] emitted payment.niftipay_orphan_paid for order ${signed.id} reference=${durableReference}`,
     );
     return true;
   }
@@ -1046,6 +1086,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger_.error(`[niftipay] webhook processing failed: ${message}`);
+      if (error instanceof RetryableNiftipayWebhookError) throw error;
       return unsupported;
     }
   }

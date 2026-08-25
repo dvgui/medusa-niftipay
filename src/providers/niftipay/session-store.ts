@@ -122,6 +122,33 @@ export class NiftipaySessionStore {
     return cartSessions[0] ?? null
   }
 
+  async findByAttemptId(
+    attemptId: string,
+    orderId?: string,
+  ): Promise<NiftipaySessionRow | null> {
+    const service = this.service()
+    if (!service?.list) return null
+
+    const sessions = await service.list(
+      { status: ["pending", "authorized", "captured"] },
+      { take: 100, order: { created_at: "DESC" }, select: FIELDS },
+    )
+    const attemptSessions = sessions.filter(
+      (session) =>
+        String(session.provider_id ?? "").includes("niftipay") &&
+        String(session.data?.niftipay_attempt_id ?? "") === attemptId,
+    )
+    if (orderId) {
+      return (
+        attemptSessions.find(
+          (session) =>
+            String(session.data?.niftipay_order_id ?? "") === orderId,
+        ) ?? null
+      )
+    }
+    return attemptSessions[0] ?? null
+  }
+
   async stamp(
     session: NiftipaySessionRow,
     patch: Record<string, unknown>,

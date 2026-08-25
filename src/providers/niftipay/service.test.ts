@@ -9,6 +9,7 @@ const ukSecret = "niftipay-uk-secret-at-least-32-chars";
 const sessionId = "payses_01M00JVM2YDY19TTT5D7FRGGHA";
 const cartId = "cart_01M00JTNERMHY7Q4BS2XZSW4KZ";
 const orderId = "3f71d8b4-2151-4a01-9346-4a1c1ca1d650";
+const attemptId = "npat_01M00JTNERMHY7Q4BS2XZSW4KZ";
 const originalFetch = globalThis.fetch;
 
 const logger = () => ({
@@ -70,6 +71,77 @@ afterEach(() => {
 });
 
 describe("Niftipay payment initiation", () => {
+  it("uses the durable attempt for every remote correlation field", async () => {
+    const requests: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (_input, init) => {
+      requests.push({ init });
+      return new Response(
+        JSON.stringify({
+          order: { id: orderId, orderKey: 33351, status: "new" },
+          payUrl: `https://www.niftipay.com/paylink/${orderId}`,
+          reference: attemptId,
+        }),
+        { status: 201 },
+      );
+    }) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    const result = await service.initiatePayment({
+      amount: 10,
+      currency_code: "gbp",
+      context: { customer: { email: "customer@example.com" } },
+      data: {
+        session_id: sessionId,
+        cart_id: cartId,
+        niftipay_attempt_id: attemptId,
+      },
+    } as never);
+
+    const body = JSON.parse(String(requests[0].init?.body));
+    expect(body.reference).toBe(attemptId);
+    expect(body.merchantReference).toBe(attemptId);
+    expect(result.data).toEqual(
+      expect.objectContaining({
+        niftipay_attempt_id: attemptId,
+        niftipay_reference: attemptId,
+        niftipay_merchant_reference: attemptId,
+      }),
+    );
+  });
+
+  it("rejects a new attempt when Niftipay returns a different correlation reference", async () => {
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          order: { id: orderId, orderKey: 33351, status: "new" },
+          payUrl: `https://www.niftipay.com/paylink/${orderId}`,
+          reference: sessionId,
+        }),
+        { status: 201 },
+      ),
+    ) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    await expect(
+      service.initiatePayment({
+        amount: 10,
+        currency_code: "gbp",
+        context: { customer: { email: "customer@example.com" } },
+        data: {
+          session_id: sessionId,
+          cart_id: cartId,
+          niftipay_attempt_id: attemptId,
+        },
+      } as never),
+    ).rejects.toThrow("different merchant reference");
+  });
+
   it("sends every supported lookup field without leaking the webhook secret", async () => {
     const requests: Array<{
       input: string | URL | Request;
@@ -124,7 +196,7 @@ describe("Niftipay payment initiation", () => {
       amount: 10,
       email: "customer@example.com",
       description: `Medusa buyreta_uk cart ${cartId} — Ada Lovelace`,
-      reference: sessionId,
+      reference: cartId,
       merchantReference: cartId,
       serviceFeePayer: "merchant",
       returnUrl: `https://store.example/payment-return/${cartId}`,
@@ -144,7 +216,7 @@ describe("Niftipay payment initiation", () => {
       expect.objectContaining({
         niftipay_order_id: orderId,
         niftipay_order_key: "33351",
-        niftipay_reference: sessionId,
+        niftipay_reference: cartId,
         niftipay_merchant_reference: cartId,
         niftipay_email: "customer@example.com",
         niftipay_customer_name: "Ada Lovelace",
@@ -653,6 +725,104 @@ describe("Niftipay fiat webhooks", () => {
         integrationId: "test-integration-id",
       }),
     });
+  });
+
+  it("emits a durable attempt reference when the payment session was deleted", async () => {
+    const { emit, service } = buildWebhookService({ sessionExists: false });
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          order: {
+            id: orderId,
+            integrationId: "test-integration-id",
+            orderKey: "33351",
+            merchantReference: attemptId,
+            status: "completed",
+            currency: "GBP",
+            amountCents: 1000,
+            subtotalCents: 1000,
+            email: "customer@example.com",
+            completedAt: "2026-08-17T07:39:56.092Z",
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+
+    await service.getWebhookActionAndData(
+      signedPayload(
+        orderId,
+        secret,
+        "test-integration-id",
+        attemptId,
+      ) as never,
+    );
+
+    expect(emit).toHaveBeenCalledWith({
+      name: "payment.niftipay_orphan_paid",
+      data: expect.objectContaining({
+        attemptId,
+        merchantReference: attemptId,
+        niftipayOrderId: orderId,
+      }),
+    });
+  });
+
+  it("rethrows a provider status lookup outage so the queued webhook retries", async () => {
+    const { service } = buildWebhookService({ sessionExists: false });
+    globalThis.fetch = mock(async () => {
+      throw new Error("provider unavailable");
+    }) as unknown as typeof fetch;
+
+    await expect(
+      service.getWebhookActionAndData(
+        signedPayload(
+          orderId,
+          secret,
+          "test-integration-id",
+          attemptId,
+        ) as never,
+      ),
+    ).rejects.toThrow("status lookup failed");
+  });
+
+  it("rethrows event-bus failures so an authenticated paid event retries", async () => {
+    const { service } = buildWebhookService({ sessionExists: false });
+    const failingEmit = mock(async () => {
+      throw new Error("event bus unavailable");
+    });
+    (service as never as { container_: Record<string, unknown> }).container_.event_bus = {
+      emit: failingEmit,
+    };
+    globalThis.fetch = mock(async () =>
+      new Response(
+        JSON.stringify({
+          order: {
+            id: orderId,
+            integrationId: "test-integration-id",
+            orderKey: "33351",
+            merchantReference: attemptId,
+            status: "completed",
+            currency: "GBP",
+            amountCents: 1000,
+            subtotalCents: 1000,
+            email: "customer@example.com",
+          },
+        }),
+        { status: 200 },
+      ),
+    ) as unknown as typeof fetch;
+
+    await expect(
+      service.getWebhookActionAndData(
+        signedPayload(
+          orderId,
+          secret,
+          "test-integration-id",
+          attemptId,
+        ) as never,
+      ),
+    ).rejects.toThrow("event bus unavailable");
   });
 
   it("uses the webhook integration's API key for orphan status lookup", async () => {

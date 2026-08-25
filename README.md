@@ -17,8 +17,8 @@ order API:
 | `currency`          | payment session              | ISO 4217 currency code            |
 | `email`             | checkout customer context    | Customer/payment lookup           |
 | `description`       | configurable template        | Human-readable cart reference     |
-| `reference`         | Medusa payment-session ID    | Live-session correlation key      |
-| `merchantReference` | Medusa cart ID               | Durable late-webhook recovery key  |
+| `reference`         | Durable payment-attempt ID   | Stable correlation key             |
+| `merchantReference` | Durable payment-attempt ID   | Stable late-webhook recovery key   |
 | `serviceFeePayer`   | provider configuration       | Merchant or customer              |
 | `returnUrl`         | brand/provider configuration | Successful hosted-checkout return |
 | `failureUrl`        | brand/provider configuration | Failed hosted-checkout return     |
@@ -28,10 +28,11 @@ customer field. It does not expose separate customer-name, phone, billing, or
 shipping fields. The plugin can include the normalized checkout name in the
 supported `description` field through the `{customer_name}` template token; it
 does not invent undocumented request keys, and it never handles raw card
-details. The cart ID is the durable searchable reference in Niftipay. Medusa
-deliberately deletes stale payment sessions whenever a cart total changes,
-while the cart survives; keeping the cart ID in `merchantReference` makes a
-late completed payment recoverable without guessing by customer email.
+details. When the host supplies `niftipay_attempt_id`, it is sent in both
+reference fields. Production evidence showed Niftipay can expose `reference`
+as its merchant reference even when a different value was submitted, so using
+one durable value prevents ambiguity. Medusa deliberately deletes stale payment
+sessions whenever a cart total changes; the host-owned attempt ledger survives.
 
 ## Install
 
@@ -85,7 +86,9 @@ export default defineConfig({
 });
 ```
 
-The checkout payment-session data must include `session_id` and `cart_id`. An
+The checkout payment-session data must include `session_id` and `cart_id`.
+Production hosts should also create and pass a durable `niftipay_attempt_id`
+before invoking the provider. An
 optional `niftipay_brand_slug` (falling back to `brand_slug`) selects matching
 entries from `brandSettings`. Brand entries can override `apiKey`, while
 `integrationId` and `webhookSecret` remain a required pair; an API-key override
@@ -155,8 +158,10 @@ the merchant reference, public order ID, currency, and amount against the
 Medusa payment session before marking payment successful.
 
 If the exact session was deleted or canceled, an integration-bound authenticated
-`paid` webhook is checked against Niftipay's status API and emitted as
-`payment.niftipay_orphan_paid` with the durable cart ID. The host backend owns
+`paid` webhook must be confirmed against Niftipay's status API and is emitted as
+`payment.niftipay_orphan_paid` with the durable attempt (or transitional cart)
+reference. Provider-status and event-bus outages throw so Medusa retries the
+queued webhook. The host backend owns
 the idempotent recovery workflow. A webhook for an older attempt is never
 attached to a newer session on the same cart: cart lookup also requires the
 public Niftipay order UUID. Legacy attempts whose merchant reference is only a
