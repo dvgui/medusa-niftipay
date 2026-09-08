@@ -45,7 +45,7 @@ import {
   optionalNumber,
   optionalString,
 } from "../../lib/niftipay-client/utils";
-import { verifyNiftipayWebhook } from "../../lib/niftipay-client/webhook";
+import { verifyNiftipayWebhookDetailed } from "../../lib/niftipay-client/webhook";
 import {
   type NiftipayResolvedCredentials,
   type NiftipayProviderOptions,
@@ -893,7 +893,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
           return unsupported;
         }
 
-        const authenticated = verifyNiftipayWebhook({
+        const auth = verifyNiftipayWebhookDetailed({
           rawBody,
           headers: payload.headers ?? {},
           data: payload.data,
@@ -903,8 +903,15 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
             allowLegacy: this.options_.allowLegacyWebhookAuth,
           },
         });
-        if (!authenticated) {
-          this.logger_.warn("[niftipay] rejected webhook authentication");
+        if (!auth.ok) {
+          // This is the orphan path: the session is gone, so a rejection here
+          // means emitOrphanPaid never runs and the payment is stranded. Say
+          // exactly why, or it cannot be triaged after the fact.
+          this.logger_.warn(
+            `[niftipay] rejected webhook authentication (orphan path) reason=${auth.reason}` +
+              `${auth.detail ? ` ${auth.detail}` : ""} event=${event} orderId=${orderId ?? "unknown"}` +
+              ` integrationId=${webhookCredentials.integrationId ?? "unknown"}`,
+          );
           return unsupported;
         }
 
@@ -919,7 +926,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
 
       const sessionCredentials = this.credentialsForSession(session);
 
-      const authenticated = verifyNiftipayWebhook({
+      const auth = verifyNiftipayWebhookDetailed({
         rawBody,
         headers: payload.headers ?? {},
         data: payload.data,
@@ -931,8 +938,12 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
           allowLegacy: this.options_.allowLegacyWebhookAuth,
         },
       });
-      if (!authenticated) {
-        this.logger_.warn("[niftipay] rejected webhook authentication");
+      if (!auth.ok) {
+        this.logger_.warn(
+          `[niftipay] rejected webhook authentication (live session) reason=${auth.reason}` +
+            `${auth.detail ? ` ${auth.detail}` : ""} session=${session.id}` +
+            ` integrationId=${sessionCredentials.integrationId ?? "unknown"}`,
+        );
         return unsupported;
       }
 

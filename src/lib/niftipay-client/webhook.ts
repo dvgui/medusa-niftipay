@@ -40,7 +40,25 @@ export const signNiftipayWebhook = (
     .update(`${timestamp}.${rawBody}`, "utf8")
     .digest("hex")
 
-export const verifyNiftipayWebhook = ({
+/**
+ * Why a webhook failed authentication. Every rejection used to collapse to a
+ * bare `false`, which made a rejected webhook impossible to triage from the
+ * logs: a stale retry, an unsigned legacy delivery and a genuinely wrong secret
+ * all looked identical. Callers log this.
+ */
+export type NiftipayWebhookAuthFailure =
+  | "malformed_signature_headers"
+  | "timestamp_outside_tolerance"
+  | "signature_mismatch"
+  | "unsigned_and_legacy_disabled"
+  | "legacy_secret_missing"
+  | "legacy_secret_mismatch"
+
+export type NiftipayWebhookAuthResult =
+  | { ok: true }
+  | { ok: false; reason: NiftipayWebhookAuthFailure; detail?: string }
+
+export const verifyNiftipayWebhookDetailed = ({
   rawBody,
   headers,
   data,
@@ -50,7 +68,7 @@ export const verifyNiftipayWebhook = ({
   headers: Record<string, unknown>
   data: unknown
   options: NiftipayWebhookAuthOptions
-}): boolean => {
+}): NiftipayWebhookAuthResult => {
   const timestamp = headerValue(headers, "x-timestamp")
   const signature = headerValue(headers, "x-signature")
 
@@ -60,37 +78,52 @@ export const verifyNiftipayWebhook = ({
       !signature?.startsWith("v1=") ||
       !/^\d{9,12}$/.test(timestamp)
     ) {
-      return false
+      return { ok: false, reason: "malformed_signature_headers" }
     }
 
     const timestampSeconds = Number(timestamp)
     const nowSeconds = Math.floor((options.now ?? Date.now()) / 1000)
-    if (
-      !Number.isFinite(timestampSeconds) ||
-      Math.abs(nowSeconds - timestampSeconds) > options.toleranceSeconds
-    ) {
-      return false
+    const skew = Math.abs(nowSeconds - timestampSeconds)
+    if (!Number.isFinite(timestampSeconds) || skew > options.toleranceSeconds) {
+      return {
+        ok: false,
+        reason: "timestamp_outside_tolerance",
+        // A retry of an older delivery lands here; the skew says how stale.
+        detail: `skew=${skew}s tolerance=${options.toleranceSeconds}s`,
+      }
     }
 
     return timingSafeHexEqual(
       signature.slice(3),
       signNiftipayWebhook(timestamp, rawBody, options.secret),
     )
+      ? { ok: true }
+      : { ok: false, reason: "signature_mismatch" }
   }
 
-  if (!options.allowLegacy) return false
+  if (!options.allowLegacy) {
+    return { ok: false, reason: "unsigned_and_legacy_disabled" }
+  }
 
   const headerSecret = headerValue(headers, "x-webhook-secret")
   const bodySecret = isRecord(data)
     ? optionalString(data.webhookSecret)
     : undefined
   const supplied = headerSecret ?? bodySecret
-  if (!supplied) return false
+  if (!supplied) return { ok: false, reason: "legacy_secret_missing" }
 
   const suppliedBytes = Buffer.from(supplied, "utf8")
   const expectedBytes = Buffer.from(options.secret, "utf8")
-  return (
-    suppliedBytes.length === expectedBytes.length &&
+  return suppliedBytes.length === expectedBytes.length &&
     crypto.timingSafeEqual(suppliedBytes, expectedBytes)
-  )
+    ? { ok: true }
+    : { ok: false, reason: "legacy_secret_mismatch" }
 }
+
+/** Boolean form, preserved for existing callers. */
+export const verifyNiftipayWebhook = (input: {
+  rawBody: string
+  headers: Record<string, unknown>
+  data: unknown
+  options: NiftipayWebhookAuthOptions
+}): boolean => verifyNiftipayWebhookDetailed(input).ok
