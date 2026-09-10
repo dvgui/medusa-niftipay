@@ -142,6 +142,48 @@ describe("Niftipay payment initiation", () => {
     ).rejects.toThrow("different merchant reference");
   });
 
+  // Regression: Niftipay enforces uniqueness on `reference`. When the value
+  // was the cart id, the first card attempt on a cart succeeded and every
+  // retry came back "Reference already exists", which the storefront showed
+  // as "Card payment is temporarily unavailable". Two attempts on the SAME
+  // cart must therefore send two different references.
+  it("sends a distinct reference for each attempt on the same cart", async () => {
+    const bodies: Array<Record<string, unknown>> = []
+    globalThis.fetch = mock(
+      async (_input: string | URL | Request, init?: RequestInit) => {
+        bodies.push(JSON.parse(String(init?.body)))
+        return new Response(
+          JSON.stringify({
+            order: { id: orderId, orderKey: 33351, status: "new" },
+            payUrl: `https://www.niftipay.com/paylink/${orderId}`,
+          }),
+          { status: 201 },
+        )
+      },
+    ) as unknown as typeof fetch
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    )
+    const attempt = (session: string) =>
+      service.initiatePayment({
+        amount: 10,
+        currency_code: "gbp",
+        context: { customer: { email: "customer@example.com" } },
+        data: { session_id: session, cart_id: cartId, brand_slug: "buyreta_uk" },
+      } as never)
+
+    await attempt(sessionId)
+    await attempt("payses_01M00JVM2YDY19TTT5D7FRGGHB")
+
+    expect(bodies).toHaveLength(2)
+    expect(bodies[0].reference).not.toBe(bodies[1].reference)
+    // The durable cart mapping still rides along for webhook recovery.
+    expect(bodies[0].merchantReference).toBe(cartId)
+    expect(bodies[1].merchantReference).toBe(cartId)
+  })
+
   it("sends every supported lookup field without leaking the webhook secret", async () => {
     const requests: Array<{
       input: string | URL | Request;
@@ -196,7 +238,9 @@ describe("Niftipay payment initiation", () => {
       amount: 10,
       email: "customer@example.com",
       description: `Medusa buyreta_uk cart ${cartId} — Ada Lovelace`,
-      reference: cartId,
+      // `reference` must be unique per attempt (Niftipay rejects repeats);
+      // `merchantReference` stays the durable cart id for webhook mapping.
+      reference: sessionId,
       merchantReference: cartId,
       serviceFeePayer: "merchant",
       returnUrl: `https://store.example/payment-return/${cartId}`,
@@ -216,7 +260,7 @@ describe("Niftipay payment initiation", () => {
       expect.objectContaining({
         niftipay_order_id: orderId,
         niftipay_order_key: "33351",
-        niftipay_reference: cartId,
+        niftipay_reference: sessionId,
         niftipay_merchant_reference: cartId,
         niftipay_email: "customer@example.com",
         niftipay_customer_name: "Ada Lovelace",

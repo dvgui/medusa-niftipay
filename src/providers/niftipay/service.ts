@@ -402,17 +402,27 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       brandSettings?.descriptionTemplate ?? this.options_.descriptionTemplate,
       { cartId, sessionId, brandSlug, customerName },
     );
-    // Send the durable attempt in BOTH fields. Production data has shown that
-    // Niftipay can echo `reference` as merchantReference, even when a different
-    // merchantReference was submitted. One durable value removes ambiguity.
+    // Niftipay enforces UNIQUENESS on `reference`. An attempt id is unique per
+    // attempt, so when we have one it can safely go in both fields (production
+    // data shows Niftipay can echo `reference` back as merchantReference, and
+    // one value removes that ambiguity).
+    //
+    // Without an attempt id the old fallback put the CART id in `reference`,
+    // which repeats across retries: the first card attempt on a cart created
+    // the order, and every retry was rejected with "Reference already exists",
+    // surfacing to the customer as "Card payment is temporarily unavailable".
+    // Nothing currently mints `npat_` ids, so that path was always taken.
+    // Keep the durable cart id in merchantReference for webhook mapping, and
+    // use the per-attempt session id for the field that must be unique.
     const durableReference = attemptId ?? cartId;
+    const uniqueReference = attemptId ?? sessionId;
     const payload: NiftipayFiatOrderPayload = {
       integrationId,
       currency,
       amount,
       email,
       description,
-      reference: durableReference,
+      reference: uniqueReference,
       merchantReference: durableReference,
       serviceFeePayer,
       ...(returnUrl ? { returnUrl } : {}),
@@ -440,7 +450,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
         niftipay_order_id: created.orderId,
         niftipay_order_key: created.orderKey,
         niftipay_redirect_url: created.payUrl,
-        niftipay_reference: durableReference,
+        niftipay_reference: uniqueReference,
         niftipay_merchant_reference: durableReference,
         niftipay_description: description,
         niftipay_integration_id: integrationId,
