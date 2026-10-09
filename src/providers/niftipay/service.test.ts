@@ -112,6 +112,78 @@ describe("Niftipay payment initiation", () => {
     );
   });
 
+  it("sends the buyer's name, phone and country from the billing address", async () => {
+    const requests: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (_input, init) => {
+      requests.push({ init });
+      return new Response(
+        JSON.stringify({
+          order: { id: orderId, orderKey: 33351, status: "new" },
+          payUrl: `https://www.niftipay.com/paylink/${orderId}`,
+          reference: sessionId,
+        }),
+        { status: 201 },
+      );
+    }) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    await service.initiatePayment({
+      amount: 10,
+      currency_code: "gbp",
+      context: { customer: { email: "customer@example.com" } },
+      data: {
+        session_id: sessionId,
+        cart_id: cartId,
+        billing_address: {
+          first_name: "Paula",
+          last_name: "Larway",
+          phone: "07899 655783",
+          country_code: "gb",
+        },
+      },
+    } as never);
+
+    const body = JSON.parse(String(requests[0].init?.body));
+    expect(body.firstName).toBe("Paula");
+    expect(body.lastName).toBe("Larway");
+    expect(body.phone).toBe("+447899655783");
+    expect(body.country).toBe("GB");
+  });
+
+  it("sends no buyer fields when it has none", async () => {
+    const requests: Array<{ init?: RequestInit }> = [];
+    globalThis.fetch = mock(async (_input, init) => {
+      requests.push({ init });
+      return new Response(
+        JSON.stringify({
+          order: { id: orderId, orderKey: 33351, status: "new" },
+          payUrl: `https://www.niftipay.com/paylink/${orderId}`,
+          reference: sessionId,
+        }),
+        { status: 201 },
+      );
+    }) as unknown as typeof fetch;
+
+    const service = new NiftipayPaymentProviderService(
+      { logger: logger() } as never,
+      options,
+    );
+    await service.initiatePayment({
+      amount: 10,
+      currency_code: "gbp",
+      context: { customer: { email: "customer@example.com" } },
+      data: { session_id: sessionId, cart_id: cartId },
+    } as never);
+
+    const body = JSON.parse(String(requests[0].init?.body));
+    for (const key of ["firstName", "lastName", "phone", "country"]) {
+      expect(body).not.toHaveProperty(key);
+    }
+  });
+
   it("rejects a new attempt when Niftipay returns a different correlation reference", async () => {
     globalThis.fetch = mock(async () =>
       new Response(
@@ -243,12 +315,17 @@ describe("Niftipay payment initiation", () => {
       reference: sessionId,
       merchantReference: cartId,
       serviceFeePayer: "merchant",
+      // Buyer details for the processor: name split from customer_name, phone
+      // normalised to E.164. No country — the address doesn't carry one.
+      firstName: "Ada",
+      lastName: "Lovelace",
+      phone: "+447700900000",
       returnUrl: `https://store.example/payment-return/${cartId}`,
       failureUrl: `https://store.example/payment-failed/${cartId}`,
     });
     expect(body).not.toHaveProperty("webhookSecret");
     expect(body).not.toHaveProperty("customerName");
-    expect(body).not.toHaveProperty("phone");
+    expect(body).not.toHaveProperty("shipping_address");
     expect(body).not.toHaveProperty("shipping_address");
     expect(request.init?.headers).toEqual(
       expect.objectContaining({ "x-api-key": "test-api-key" }),

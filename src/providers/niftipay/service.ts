@@ -31,6 +31,7 @@ import type {
 } from "@medusajs/framework/types";
 
 import { NiftipayClient } from "../../lib/niftipay-client/client";
+import { niftipayBuyerDetails } from "../../lib/niftipay-client/buyer";
 import { toMinorUnits } from "../../lib/niftipay-client/money";
 import { normalizeNiftipayWebhook } from "../../lib/niftipay-client/normalize";
 import type {
@@ -416,6 +417,14 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
     // use the per-attempt session id for the field that must be unique.
     const durableReference = attemptId ?? cartId;
     const uniqueReference = attemptId ?? sessionId;
+    // Cardholder details help the processor's fraud checks; only what we can
+    // state with certainty is sent (see lib/niftipay-client/buyer).
+    const buyer = niftipayBuyerDetails({
+      billingAddress: paymentData(data.billing_address),
+      shippingAddress: paymentData(data.shipping_address),
+      customerName,
+      customerPhone: customerContext.phone ?? data.phone,
+    });
     const payload: NiftipayFiatOrderPayload = {
       integrationId,
       currency,
@@ -425,6 +434,7 @@ class NiftipayPaymentProviderService extends AbstractPaymentProvider<NiftipayPro
       reference: uniqueReference,
       merchantReference: durableReference,
       serviceFeePayer,
+      ...buyer,
       ...(returnUrl ? { returnUrl } : {}),
       ...(failureUrl ? { failureUrl } : {}),
     };

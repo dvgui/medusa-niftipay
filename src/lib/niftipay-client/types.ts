@@ -27,6 +27,13 @@ export type NiftipayFiatOrderPayload = Readonly<{
   email?: string
   returnUrl?: string
   failureUrl?: string
+  /** Buyer details for the card processor; each optional, blank is ignored. */
+  firstName?: string
+  lastName?: string
+  /** E.164, e.g. +34600111222. */
+  phone?: string
+  /** ISO 3166-1 alpha-2, e.g. GB. */
+  country?: string
 }> &
   FiatOrderAmount
 

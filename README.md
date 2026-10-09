@@ -22,13 +22,21 @@ order API:
 | `serviceFeePayer`   | provider configuration       | Merchant or customer              |
 | `returnUrl`         | brand/provider configuration | Successful hosted-checkout return |
 | `failureUrl`        | brand/provider configuration | Failed hosted-checkout return     |
+| `firstName`         | billing → shipping → name    | Buyer details for the processor   |
+| `lastName`          | billing → shipping → name    | Buyer details for the processor   |
+| `phone`             | billing → shipping → customer| E.164, e.g. `+34600111222`        |
+| `country`           | billing → shipping address   | ISO 3166-1 alpha-2, e.g. `GB`     |
 
-Niftipay's fiat order API currently accepts `email` as its only structured
-customer field. It does not expose separate customer-name, phone, billing, or
-shipping fields. The plugin can include the normalized checkout name in the
-supported `description` field through the `{customer_name}` template token; it
-does not invent undocumented request keys, and it never handles raw card
-details. When the host supplies `niftipay_attempt_id`, it is sent in both
+Niftipay passes `firstName`, `lastName`, `phone` and `country` to the card
+processor for that transaction only (announced by Niftipay in October 2026;
+all optional, blank fields ignored). They come from the `billing_address`,
+then the `shipping_address` in the session data, then the customer name. The
+plugin sends only what it can state with certainty: a phone is normalised to
+E.164 (national numbers via the address country) and dropped when it can't be
+(e.g. a UK number with the wrong digit count); a country is sent only as a
+valid 2-letter code. A wrong value is worse than none for fraud scoring.
+Billing, shipping and raw addresses themselves are never sent, and the plugin
+never handles raw card details. When the host supplies `niftipay_attempt_id`, it is sent in both
 reference fields. Production evidence showed Niftipay can expose `reference`
 as its merchant reference even when a different value was submitted, so using
 one durable value prevents ambiguity. Medusa deliberately deletes stale payment
